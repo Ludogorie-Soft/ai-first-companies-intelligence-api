@@ -84,7 +84,7 @@ router.post('/register', async (req: Request, res: Response): Promise<void> => {
   });
 
   const token = jwt.sign(
-    { sub: user.id, tenantId: tenant.id, email: user.email, emailVerified: user.emailVerified },
+    { sub: user.id, tenantId: tenant.id, email: user.email, emailVerified: user.emailVerified, role: user.role },
     process.env.JWT_SECRET!,
     { expiresIn: '7d' }
   );
@@ -100,7 +100,7 @@ router.post('/register', async (req: Request, res: Response): Promise<void> => {
 
   res.status(201).json({
     token,
-    user: { id: user.id, email: user.email, emailVerified: user.emailVerified, tenantId: tenant.id },
+    user: { id: user.id, email: user.email, emailVerified: user.emailVerified, tenantId: tenant.id, role: user.role },
     ...(devVerificationUrl !== undefined ? { devVerificationUrl } : {}),
   });
 });
@@ -151,14 +151,14 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
   }
 
   const token = jwt.sign(
-    { sub: user.id, tenantId: user.tenantId, email: user.email, emailVerified: user.emailVerified },
+    { sub: user.id, tenantId: user.tenantId, email: user.email, emailVerified: user.emailVerified, role: user.role },
     process.env.JWT_SECRET!,
     { expiresIn: '7d' }
   );
 
   res.json({
     token,
-    user: { id: user.id, email: user.email, emailVerified: user.emailVerified, tenantId: user.tenantId },
+    user: { id: user.id, email: user.email, emailVerified: user.emailVerified, tenantId: user.tenantId, role: user.role },
   });
 });
 
@@ -205,7 +205,7 @@ router.get('/confirm-email', async (req: Request, res: Response): Promise<void> 
     // Without this the stored token (minted at register/login) would retain emailVerified:false
     // and requireVerified would block uploads until the user manually re-logged in.
     const freshToken = jwt.sign(
-      { sub: user.id, tenantId: user.tenantId, email: user.email, emailVerified: true },
+      { sub: user.id, tenantId: user.tenantId, email: user.email, emailVerified: true, role: user.role },
       process.env.JWT_SECRET!,
       { expiresIn: '7d' }
     );

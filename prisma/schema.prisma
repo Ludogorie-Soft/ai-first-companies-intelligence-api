@@ -31,11 +31,47 @@ model User {
   email                  String   @unique
   passwordHash           String
   tenantId               String
+  role                   UserRole @default(USER)
+  monthlyDomainLimit     Int?
   emailVerified          Boolean  @default(false)
   emailVerificationToken String?  @unique
   createdAt              DateTime @default(now())
 
-  tenant Tenant @relation(fields: [tenantId], references: [id])
+  tenant          Tenant             @relation(fields: [tenantId], references: [id])
+  monthlyUsage    UserMonthlyUsage[]
+  adminAuditLogs  AuditLog[]         @relation("AdminAuditLogs")
+  targetAuditLogs AuditLog[]         @relation("TargetAuditLogs")
+}
+
+model AuditLog {
+  id           String   @id @default(uuid())
+  adminUserId  String
+  targetUserId String
+  action       String
+  field        String?
+  oldValue     String?
+  newValue     String?
+  createdAt    DateTime @default(now())
+
+  adminUser  User @relation("AdminAuditLogs", fields: [adminUserId], references: [id])
+  targetUser User @relation("TargetAuditLogs", fields: [targetUserId], references: [id])
+
+  @@index([adminUserId])
+  @@index([targetUserId])
+  @@index([createdAt])
+}
+
+model UserMonthlyUsage {
+  id          String   @id @default(uuid())
+  userId      String
+  month       String
+  domainsUsed Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, month])
 }
 
 model Company {
@@ -193,6 +229,11 @@ enum BatchStatus {
 enum BatchSourceType {
   UPLOAD
   PERSONA_SEARCH
+}
+
+enum UserRole {
+  USER
+  ADMIN
 }
 
 enum CrawlStatus {

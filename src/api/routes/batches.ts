@@ -228,6 +228,31 @@ router.post(
         return;
       }
 
+      // Monthly domain limit check — skipped for ADMIN users and users with no limit set
+      const userId = req.user.sub;
+      const userRecord = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { role: true, monthlyDomainLimit: true },
+      });
+      const month = new Date().toISOString().slice(0, 7);
+      if (userRecord && userRecord.role !== 'ADMIN' && userRecord.monthlyDomainLimit !== null) {
+        const usage = await prisma.userMonthlyUsage.findUnique({
+          where: { userId_month: { userId, month } },
+          select: { domainsUsed: true },
+        });
+        const used = usage?.domainsUsed ?? 0;
+        if (used + domains.length > userRecord.monthlyDomainLimit) {
+          res.status(403).json({
+            error: 'Monthly domain limit exceeded',
+            limit: userRecord.monthlyDomainLimit,
+            used,
+            requested: domains.length,
+            remaining: Math.max(0, userRecord.monthlyDomainLimit - used),
+          });
+          return;
+        }
+      }
+
       // Save uploaded file
       const storedPath = StorageService.upload(
         `uploads/${tenantId}`,
@@ -303,6 +328,13 @@ router.post(
       await prisma.tenant.update({
         where: { id: tenantId },
         data: { weeklyUsage: { increment: domains.length } },
+      });
+
+      // Increment per-user monthly usage
+      await prisma.userMonthlyUsage.upsert({
+        where: { userId_month: { userId: req.user.sub, month } },
+        create: { userId: req.user.sub, month, domainsUsed: domains.length },
+        update: { domainsUsed: { increment: domains.length } },
       });
 
       res.status(201).json({

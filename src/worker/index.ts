@@ -764,7 +764,15 @@ async function processPersonalizeJob(
   console.log(`[worker/personalize] Saved content for ${companyId}`);
 }
 
-async function main(): Promise<void> {
+let workerStarted = false;
+
+export async function startWorker(): Promise<void> {
+  if (workerStarted) {
+    console.log('[worker] already started — skipping');
+    return;
+  }
+  workerStarted = true;
+
   console.log('[worker] starting...');
   const queue = await getQueue();
 
@@ -792,7 +800,7 @@ async function main(): Promise<void> {
 
   console.log(`[worker] listening on queues "${QUEUES.CRAWL_COMPANY}", "${QUEUES.DISCOVER_PERSONA}", "${QUEUES.PERSONALIZE_COMPANY}" (concurrency: ${CONCURRENCY})`);
 
-  // Graceful shutdown
+  // Graceful shutdown — handles both standalone and embedded modes
   const shutdown = async (signal: string) => {
     console.log(`[worker] received ${signal}, shutting down...`);
     await stopQueue();
@@ -804,7 +812,10 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
-main().catch((err) => {
-  console.error('[worker] fatal error:', err);
-  process.exit(1);
-});
+// Standalone entry point: npm run start:worker → node dist/worker/index.js
+if (require.main === module) {
+  startWorker().catch((err) => {
+    console.error('[worker] fatal error:', err);
+    process.exit(1);
+  });
+}

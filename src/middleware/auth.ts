@@ -6,6 +6,7 @@ export interface JwtPayload {
   tenantId: string;
   email?: string;
   emailVerified?: boolean;
+  role?: string;      // 'USER' | 'ADMIN' — absent on tokens issued before this field was added
   iat?: number;
   exp?: number;
 }
@@ -16,14 +17,6 @@ declare global {
       user: JwtPayload;
     }
   }
-}
-
-export function requireVerified(req: Request, res: Response, next: NextFunction): void {
-  if (!req.user.emailVerified) {
-    res.status(403).json({ error: 'Email verification required. Please check your inbox and verify your email address.' });
-    return;
-  }
-  next();
 }
 
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
@@ -49,4 +42,20 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
   } catch {
     res.status(401).json({ error: 'Invalid or expired token' });
   }
+}
+
+export function requireVerified(req: Request, res: Response, next: NextFunction): void {
+  if (!req.user.emailVerified) {
+    res.status(403).json({ error: 'Email verification required. Please check your inbox and verify your email address.' });
+    return;
+  }
+  next();
+}
+
+export function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+  if (req.user.role !== 'ADMIN') {
+    res.status(403).json({ error: 'Admin access required' });
+    return;
+  }
+  next();
 }
