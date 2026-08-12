@@ -3,7 +3,6 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
-import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from '../lib/swagger';
 import { getQueue, QUEUES } from '../lib/queue';
 
@@ -25,6 +24,37 @@ if (!_jwtSecret || _jwtSecret.trim() === '' || _jwtSecret === JWT_SECRET_PLACEHO
     '[startup] FATAL: JWT_SECRET is missing or still set to the .env.example placeholder. ' +
       'Generate one with: node -e "require(\'crypto\').randomBytes(64).toString(\'hex\')"'
   );
+}
+
+/** CDN assets — swagger-ui-express static files are not available in the Vercel bundle. */
+const SWAGGER_UI_VERSION = '5.11.0';
+
+function swaggerDocsHtml(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Companies Intelligence API</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@${SWAGGER_UI_VERSION}/swagger-ui.css" />
+  <style>body { margin: 0; }</style>
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist@${SWAGGER_UI_VERSION}/swagger-ui-bundle.js" crossorigin></script>
+  <script src="https://unpkg.com/swagger-ui-dist@${SWAGGER_UI_VERSION}/swagger-ui-standalone-preset.js" crossorigin></script>
+  <script>
+    window.onload = () => {
+      window.ui = SwaggerUIBundle({
+        url: '/docs.json',
+        dom_id: '#swagger-ui',
+        presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
+        layout: 'StandaloneLayout',
+      });
+    };
+  </script>
+</body>
+</html>`;
 }
 
 const app = express();
@@ -67,7 +97,10 @@ app.get('/health', async (_req, res) => {
   res.json(body);
 });
 
-app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+// CDN-backed Swagger UI (works on Vercel; local swagger-ui-dist assets are not bundled).
+app.get(['/docs', '/docs/'], (_req, res) => {
+  res.type('html').send(swaggerDocsHtml());
+});
 app.get('/docs.json', (_req, res) => res.json(swaggerSpec));
 
 app.use('/api/auth', authRouter);
