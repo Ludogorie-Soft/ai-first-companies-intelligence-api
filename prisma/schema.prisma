@@ -19,6 +19,12 @@ model Tenant {
   contactPersonTitle  String?
   contactPersonEmail  String?
   contactPersonPhone  String?
+  /// Sender company "About us" — used for truthful outreach generation
+  aboutUs             String?
+  /// Sender products / services description
+  productsServices    String?
+  /// Sender portfolio / case studies
+  portfolio           String?
 
   crawlBatches    CrawlBatch[]
   tenantCompanies TenantCompany[]

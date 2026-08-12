@@ -1,3 +1,14 @@
+import {
+  emailLanguageInstruction,
+  type ResolvedEmailLanguage,
+} from '../lib/emailLanguage';
+import {
+  buildSenderCompanyContext,
+  SENDER_TRUTHFULNESS_RULES,
+  type SenderCompanyInfo,
+} from '../lib/senderCompany';
+
+/** Target (recipient) company profile from crawl. */
 interface ProfileInput {
   name?: string;
   description?: string;
@@ -15,7 +26,7 @@ export interface PersonalizedOutput {
   fullMessage?: string;
 }
 
-function buildProfileContext(profile: ProfileInput): string {
+function buildTargetContext(profile: ProfileInput): string {
   const lines: string[] = [];
 
   if (profile.name)        lines.push(`Company name: ${profile.name}`);
@@ -42,6 +53,8 @@ function buildProfileContext(profile: ProfileInput): string {
 
 export async function generatePersonalizedContent(
   profile: ProfileInput,
+  emailLanguage: ResolvedEmailLanguage = 'bg',
+  sender?: SenderCompanyInfo,
 ): Promise<PersonalizedOutput | null> {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
@@ -49,31 +62,41 @@ export async function generatePersonalizedContent(
     return null;
   }
 
-  const context = buildProfileContext(profile);
-  if (!context.trim()) {
+  const targetContext = buildTargetContext(profile);
+  if (!targetContext.trim()) {
     console.warn('[personalization] No usable profile data — skipping');
     return null;
   }
 
+  const senderContext = sender
+    ? buildSenderCompanyContext(sender)
+    : '';
+  const senderBlock = senderContext.trim()
+    ? `SENDER COMPANY DATA (your company — the only source of truth for what YOU offer):\n${senderContext}`
+    : `SENDER COMPANY DATA: (not provided — do NOT invent products, services, experience, or case studies about the sender)`;
+
   const prompt = `You are a B2B sales expert writing personalized cold outreach emails.
 
-Based on the following company information, generate a personalized B2B outreach email.
+Write outreach FROM the sender company TO the target company.
 
-Company information:
-${context}
+TARGET COMPANY (the recipient — use for personalization only):
+${targetContext}
+
+${senderBlock}
+
+${SENDER_TRUTHFULNESS_RULES}
 
 Generate a JSON object with exactly these fields:
 {
   "emailSubject": "short compelling subject line, under 60 characters",
-  "openingLine": "personalized first sentence referencing something specific about this company (1-2 sentences)",
-  "valueProposition": "how you can add value to their specific business (1-2 sentences)",
-  "fullMessage": "complete professional email body (3-4 short paragraphs, professional but conversational tone, no greeting or sign-off)"
+  "openingLine": "personalized first sentence referencing something specific about the TARGET company (1-2 sentences)",
+  "valueProposition": "how the SENDER can help — based ONLY on SENDER COMPANY DATA, tied to the TARGET's context (1-2 sentences). If sender data is missing, write a cautious non-claiming sentence.",
+  "fullMessage": "complete professional email body (3-4 short paragraphs, professional but conversational tone, no greeting or sign-off). Personalize to TARGET; claim about SENDER only what is in SENDER COMPANY DATA."
 }
 
 Rules:
-- Use ONLY facts from the provided company information
-- Do NOT invent facts, numbers, or specific claims not present in the data
-- If information is limited, write an honest general outreach without fabricating details
+- Use TARGET facts only to show you researched them — never invent TARGET facts either
+- ${emailLanguageInstruction(emailLanguage)}
 - Output ONLY valid JSON with no additional text or markdown fences
 
 JSON:`;

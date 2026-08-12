@@ -5,7 +5,7 @@ import { rawProfileCacheDecision } from '../lib/rawProfileCache';
 import { getQueue, QUEUES, CrawlCompanyPayload, DiscoverPersonaPayload, PersonalizeCompanyPayload, enqueueCrawlJob, enqueuePersonalizeJob, stopQueue } from '../lib/queue';
 import { prisma } from '../lib/prisma';
 import { crawlCompany, detectBotProtection, BOT_CRAWL_NOTE } from './crawl';
-import { extractProfile, isGenericAuthName } from '../services/extraction';
+import { extractProfile, isGenericAuthName, detectWebsiteLanguage } from '../services/extraction';
 import { enrichSocialLinks } from '../services/socialEnrichment';
 import { enrichAddress } from '../services/addressEnrichment';
 import { validateAddress } from '../services/addressValidation';
@@ -18,6 +18,8 @@ import { findCachedDiscovery, copyCandidatesToBatch } from '../services/discover
 import { checkFreshness } from '../lib/freshness';
 import { generatePersonalizedContent } from '../services/personalization';
 import { generateCampaignEmail } from '../services/campaignEmailGeneration';
+import { parseEmailLanguage, resolveEmailLanguage } from '../lib/emailLanguage';
+import type { EmailLanguagePreference } from '../lib/emailLanguage';
 import PgBoss from 'pg-boss';
 
 const CONCURRENCY = parseInt(process.env.WORKER_CONCURRENCY || '5', 10);
@@ -29,7 +31,8 @@ async function processJob(jobs: PgBoss.JobWithMetadata<CrawlCompanyPayload>[]): 
 }
 
 async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>): Promise<void> {
-  const { companyId, domain, baseUrl, batchId, tenantId, templateId } = job.data;
+  const { companyId, domain, baseUrl, batchId, tenantId, templateId, emailLanguage: rawEmailLanguage } = job.data;
+  const emailLanguagePref = parseEmailLanguage(rawEmailLanguage);
   console.log(`[worker] processing ${domain} (${companyId})`);
 
   // Final safety guard — abort immediately if a non-crawlable platform somehow reached the worker.
@@ -106,6 +109,11 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
 
     // 3. Extract processed profile
     const profile = extractProfile(pages);
+    const resolvedEmailLanguage = resolveEmailLanguage(
+      emailLanguagePref,
+      detectWebsiteLanguage(pages),
+    );
+    console.log(`[worker:email-language] ${domain} preference=${emailLanguagePref} resolved=${resolvedEmailLanguage}`);
 
     console.log(`[worker:profile] ${domain} — pages(${pages.length})=${JSON.stringify(pages.map(p => p.url))} emails(${profile.emails.length})=${JSON.stringify(profile.emails)}`);
 
@@ -296,6 +304,9 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
               contactPersonTitle: true,
               contactPersonEmail: true,
               contactPersonPhone: true,
+              aboutUs: true,
+              productsServices: true,
+              portfolio: true,
             },
           });
           const hasSenderInfo = !!tenant?.contactPersonName;
@@ -325,6 +336,10 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
                 senderContactTitle: tenant.contactPersonTitle ?? '',
                 senderContactEmail: senderEmail,
                 senderContactPhone: tenant.contactPersonPhone ?? '',
+                senderAboutUs:          tenant.aboutUs ?? undefined,
+                senderProductsServices: tenant.productsServices ?? undefined,
+                senderPortfolio:        tenant.portfolio ?? undefined,
+                emailLanguage:     resolvedEmailLanguage,
               },
               undefined,
               templateBodyResolved,
@@ -435,7 +450,7 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
     // 6. Enqueue personalization — best-effort; failure must not cause a crawl retry or FAILED status
     try {
       const pQueue = await getQueue();
-      await enqueuePersonalizeJob({ companyId }, pQueue);
+      await enqueuePersonalizeJob({ companyId, tenantId, emailLanguage: resolvedEmailLanguage }, pQueue);
     } catch (personErr) {
       console.error(`[worker] personalize enqueue failed for ${domain}:`, personErr);
     }
@@ -527,6 +542,7 @@ async function enqueueCrawlsFromEntries(
   forceRecrawl: boolean,
   templateId: string | undefined,
   crawlQueue: PgBoss,
+  emailLanguage?: EmailLanguagePreference,
 ): Promise<void> {
   const crawlable = entries
     .filter(e => !e.domain.endsWith('.local') && !isNonCrawlablePlatform(e.domain))
@@ -581,7 +597,7 @@ async function enqueueCrawlsFromEntries(
     } else {
       console.log(`[discover] enqueued crawl for candidate ${domain} — ${freshness.reason}`);
       await enqueueCrawlJob(
-        { companyId: company.id, domain, baseUrl, batchId, tenantId, templateId },
+        { companyId: company.id, domain, baseUrl, batchId, tenantId, templateId, emailLanguage },
         crawlQueue,
       );
       jobsEnqueued++;
@@ -601,8 +617,9 @@ async function enqueueCrawlsFromEntries(
 async function processDiscoverJob(
   job: PgBoss.JobWithMetadata<DiscoverPersonaPayload>
 ): Promise<void> {
-  const { batchId, tenantId, persona, location, keywords, maxResults, forceRecrawl, templateId } = job.data;
+  const { batchId, tenantId, persona, location, keywords, maxResults, forceRecrawl, templateId, emailLanguage } = job.data;
   console.log(`[worker/discover] starting discovery: "${persona}" in "${location}"`);
+  const emailLanguagePref = parseEmailLanguage(emailLanguage);
 
   const limit      = maxResults ?? 50;
   const crawlQueue = await getQueue();
@@ -628,7 +645,7 @@ async function processDiscoverJob(
 
         await enqueueCrawlsFromEntries(
           keptRows.map(r => ({ domain: r.domain, name: r.orgName ?? r.title })),
-          batchId, tenantId, limit, forceRecrawl ?? false, templateId, crawlQueue,
+          batchId, tenantId, limit, forceRecrawl ?? false, templateId, crawlQueue, emailLanguagePref,
         );
         return;
       }
@@ -701,7 +718,7 @@ async function processDiscoverJob(
     );
 
     await enqueueCrawlsFromEntries(
-      acceptedEntries, batchId, tenantId, limit, forceRecrawl ?? false, templateId, crawlQueue,
+      acceptedEntries, batchId, tenantId, limit, forceRecrawl ?? false, templateId, crawlQueue, emailLanguagePref,
     );
 
   } catch (err) {
@@ -735,12 +752,43 @@ async function processDiscoverJob(
 async function processPersonalizeJob(
   job: PgBoss.JobWithMetadata<PersonalizeCompanyPayload>
 ): Promise<void> {
-  const { companyId } = job.data;
+  const { companyId, tenantId, emailLanguage } = job.data;
+  const resolvedLanguage = emailLanguage === 'en' ? 'en' : 'bg';
 
   const profile = await prisma.companyProfile.findUnique({ where: { companyId } });
   if (!profile) {
     console.log(`[worker/personalize] No profile for ${companyId} — skipping`);
     return;
+  }
+
+  let sender: {
+    companyName?: string;
+    website?: string;
+    aboutUs?: string;
+    productsServices?: string;
+    portfolio?: string;
+  } | undefined;
+
+  if (tenantId) {
+    const tenant = await prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: {
+        name: true,
+        website: true,
+        aboutUs: true,
+        productsServices: true,
+        portfolio: true,
+      },
+    });
+    if (tenant) {
+      sender = {
+        companyName: tenant.name,
+        website: tenant.website ?? undefined,
+        aboutUs: tenant.aboutUs ?? undefined,
+        productsServices: tenant.productsServices ?? undefined,
+        portfolio: tenant.portfolio ?? undefined,
+      };
+    }
   }
 
   const result = await generatePersonalizedContent({
@@ -751,7 +799,7 @@ async function processPersonalizeJob(
     team:        Array.isArray(profile.team)     ? (profile.team as Array<{ name: string; position?: string }>) : [],
     history:     profile.history     ?? undefined,
     emails:      Array.isArray(profile.emails)   ? (profile.emails as string[])                               : [],
-  });
+  }, resolvedLanguage, sender);
 
   if (!result) return;
 

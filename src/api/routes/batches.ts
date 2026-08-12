@@ -11,17 +11,19 @@ import { isNonCrawlablePlatform } from '../../services/nonCrawlablePlatforms';
 import { checkFreshness } from '../../lib/freshness';
 import { requireAuth, requireVerified } from '../../middleware/auth';
 import { ExportService } from '../../services/export';
+import { emailLanguageFromSearchQuery } from '../../lib/emailLanguage';
 
 const router = Router();
 
-const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5 MB
+// Cap below Vercel Hobby ~4.5 MB request body limit.
+const MAX_FILE_SIZE = 4 * 1024 * 1024; // 4 MB
 const upload = multer({ dest: '/tmp/uploads/', limits: { fileSize: MAX_FILE_SIZE } });
 
 // Wrap multer so file-size errors return a clean 400 instead of crashing the request.
 function uploadSingle(req: Request, res: Response, next: NextFunction): void {
   upload.single('file')(req, res, (err: unknown) => {
     if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
-      res.status(400).json({ error: 'Uploaded file exceeds maximum size of 5 MB' });
+      res.status(400).json({ error: 'Uploaded file exceeds maximum size of 4 MB' });
       return;
     }
     if (err) { next(err); return; }
@@ -665,7 +667,15 @@ router.patch('/:id/candidates/:domain', requireAuth, async (req: Request, res: R
 
         const queue = await getQueue();
         await enqueueCrawlJob(
-          { companyId: company.id, domain, baseUrl, batchId, tenantId },
+          {
+            companyId: company.id,
+            domain,
+            baseUrl,
+            batchId,
+            tenantId,
+            templateId: batch.templateId ?? undefined,
+            emailLanguage: emailLanguageFromSearchQuery(batch.searchQuery),
+          },
           queue,
         );
         res.json({ ok: true, crawlTriggered: true });
@@ -748,7 +758,15 @@ router.post('/:id/re-enrich', requireAuth, requireVerified, async (req: Request,
         continue;
       }
       await enqueueCrawlJob(
-        { companyId: company.id, domain: company.domain, baseUrl: company.baseUrl, batchId: id, tenantId, templateId: batch.templateId ?? undefined },
+        {
+          companyId: company.id,
+          domain: company.domain,
+          baseUrl: company.baseUrl,
+          batchId: id,
+          tenantId,
+          templateId: batch.templateId ?? undefined,
+          emailLanguage: emailLanguageFromSearchQuery(batch.searchQuery),
+        },
         queue,
       );
     }

@@ -1,0 +1,822 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Companies Intelligence API",
+    "version": "1.0.0",
+    "description": "B2B Data Enrichment Engine — upload company domains, crawl websites, extract structured profiles."
+  },
+  "servers": [
+    {
+      "url": "http://localhost:3001"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "JWT token with tenantId claim. Generate one via: node -e \"const jwt=require('jsonwebtoken');console.log(jwt.sign({sub:'user-1',tenantId:'test-tenant-id'},process.env.JWT_SECRET,{expiresIn:'7d'}))\""
+      }
+    },
+    "schemas": {
+      "Batch": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string"
+          },
+          "fileName": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "PENDING",
+              "PROCESSING",
+              "COMPLETED",
+              "FAILED"
+            ]
+          },
+          "totalCompanies": {
+            "type": "integer"
+          },
+          "processedCompanies": {
+            "type": "integer"
+          },
+          "completionPercentage": {
+            "type": "number"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Company": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "domain": {
+            "type": "string"
+          },
+          "baseUrl": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "crawlStatus": {
+            "type": "string",
+            "enum": [
+              "PENDING",
+              "CRAWLING",
+              "COMPLETED",
+              "FAILED"
+            ]
+          },
+          "lastCrawledAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "profile": {
+            "$ref": "#/components/schemas/CompanyProfile",
+            "nullable": true
+          },
+          "personalizedContents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PersonalizedContent"
+            }
+          }
+        }
+      },
+      "CompanyProfile": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "location": {
+            "type": "string",
+            "nullable": true
+          },
+          "emails": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "phones": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "services": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "team": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "history": {
+            "type": "string",
+            "nullable": true
+          },
+          "socialLinks": {
+            "type": "object"
+          },
+          "completionScore": {
+            "type": "number"
+          }
+        }
+      },
+      "PersonalizedContent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "emailSubject": {
+            "type": "string",
+            "nullable": true
+          },
+          "openingLine": {
+            "type": "string",
+            "nullable": true
+          },
+          "valueProposition": {
+            "type": "string",
+            "nullable": true
+          },
+          "fullMessage": {
+            "type": "string",
+            "nullable": true
+          },
+          "generatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "paths": {
+    "/api/auth/register": {
+      "post": {
+        "summary": "Register a new user and tenant",
+        "tags": [
+          "Auth"
+        ],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "email",
+                  "password",
+                  "tenantName"
+                ],
+                "properties": {
+                  "email": {
+                    "type": "string",
+                    "format": "email"
+                  },
+                  "password": {
+                    "type": "string",
+                    "minLength": 8
+                  },
+                  "tenantName": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "User registered, JWT returned"
+          },
+          "400": {
+            "description": "Validation error or email already taken"
+          }
+        }
+      }
+    },
+    "/api/auth/login": {
+      "post": {
+        "summary": "Login with email and password",
+        "tags": [
+          "Auth"
+        ],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "email",
+                  "password"
+                ],
+                "properties": {
+                  "email": {
+                    "type": "string"
+                  },
+                  "password": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Login successful, JWT returned"
+          },
+          "401": {
+            "description": "Invalid credentials"
+          }
+        }
+      }
+    },
+    "/api/auth/confirm-email": {
+      "get": {
+        "summary": "Confirm email address via token from email link",
+        "tags": [
+          "Auth"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "token",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirects to dashboard with result"
+          }
+        }
+      }
+    },
+    "/api/batches/upload": {
+      "post": {
+        "summary": "Upload a CSV/Excel file of company domains",
+        "tags": [
+          "Batches"
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "force_recrawl",
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Force re-crawl even if company was crawled within 30 days"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "CSV or Excel file with domain names"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Batch created and jobs enqueued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "batchId": {
+                      "type": "string"
+                    },
+                    "totalCompanies": {
+                      "type": "integer"
+                    },
+                    "jobsEnqueued": {
+                      "type": "integer"
+                    },
+                    "skipped": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Weekly quota exceeded"
+          }
+        }
+      }
+    },
+    "/api/batches/{id}": {
+      "get": {
+        "summary": "Get batch status and progress",
+        "tags": [
+          "Batches"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Batch details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Batch"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Batch not found"
+          }
+        }
+      }
+    },
+    "/api/batches/{id}/companies": {
+      "get": {
+        "summary": "List companies in a batch (paginated)",
+        "tags": [
+          "Batches"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer",
+              "default": 1
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated list of companies with profiles",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Company"
+                      }
+                    },
+                    "pagination": {
+                      "type": "object",
+                      "properties": {
+                        "page": {
+                          "type": "integer"
+                        },
+                        "limit": {
+                          "type": "integer"
+                        },
+                        "total": {
+                          "type": "integer"
+                        },
+                        "pages": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/batches/{id}/download": {
+      "get": {
+        "summary": "Download batch export as CSV or XLSX",
+        "tags": [
+          "Batches"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "format",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "csv",
+                "xlsx"
+              ],
+              "default": "csv"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "File download",
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Batch not found"
+          }
+        }
+      }
+    },
+    "/api/batches/{id}/re-enrich": {
+      "post": {
+        "summary": "Re-crawl, re-extract, and re-personalize all companies in a batch",
+        "description": "Resets batch progress and enqueues crawl jobs for every company in the batch, bypassing the 30-day deduplication cache. The worker automatically generates PersonalizedContent after each successful crawl.",
+        "tags": [
+          "Batches"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Re-enrichment started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "batchId": {
+                      "type": "string"
+                    },
+                    "reEnqueuedCompanies": {
+                      "type": "integer"
+                    },
+                    "status": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Batch not found"
+          }
+        }
+      }
+    },
+    "/api/companies/{domain}": {
+      "get": {
+        "summary": "Get a company and its extracted profile by domain",
+        "tags": [
+          "Companies"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "google.com"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Company with profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Company"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Company not found"
+          }
+        }
+      }
+    },
+    "/api/exports/{batchId}": {
+      "get": {
+        "summary": "Generate an export for a batch and get the download URL",
+        "tags": [
+          "Exports"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "batchId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "format",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "csv",
+                "xlsx"
+              ],
+              "default": "csv"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Export generated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "downloadUrl": {
+                      "type": "string"
+                    },
+                    "exportPath": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Batch not found"
+          }
+        }
+      }
+    },
+    "/api/persona-searches": {
+      "post": {
+        "summary": "Start a persona-based lead discovery search",
+        "tags": [
+          "Persona"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "persona",
+                  "location"
+                ],
+                "properties": {
+                  "persona": {
+                    "type": "string",
+                    "example": "детски градини"
+                  },
+                  "location": {
+                    "type": "string",
+                    "example": "област Ловеч"
+                  },
+                  "keywords": {
+                    "type": "string",
+                    "example": "частни"
+                  },
+                  "maxResults": {
+                    "type": "integer",
+                    "default": 20,
+                    "minimum": 5,
+                    "maximum": 50
+                  },
+                  "emailLanguage": {
+                    "type": "string",
+                    "enum": [
+                      "bg",
+                      "en",
+                      "website"
+                    ],
+                    "default": "bg",
+                    "description": "Language for Email Subject, Outreach Message, and Campaign Email"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Search started, batch created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "batchId": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "429": {
+            "description": "Weekly quota exceeded"
+          }
+        }
+      }
+    },
+    "/api/tenant/profile": {
+      "get": {
+        "summary": "Get tenant profile (sender info for campaign emails)",
+        "tags": [
+          "Tenant"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tenant profile"
+          }
+        }
+      },
+      "put": {
+        "summary": "Update tenant profile (sender info for campaign emails)",
+        "tags": [
+          "Tenant"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "website": {
+                    "type": "string"
+                  },
+                  "contactPersonName": {
+                    "type": "string"
+                  },
+                  "contactPersonTitle": {
+                    "type": "string"
+                  },
+                  "contactPersonEmail": {
+                    "type": "string"
+                  },
+                  "contactPersonPhone": {
+                    "type": "string"
+                  },
+                  "aboutUs": {
+                    "type": "string"
+                  },
+                  "productsServices": {
+                    "type": "string"
+                  },
+                  "portfolio": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated tenant profile"
+          }
+        }
+      }
+    }
+  },
+  "tags": []
+}

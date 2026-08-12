@@ -1,7 +1,14 @@
 import fs from 'fs';
 import path from 'path';
 
-const BASE_PATH = process.env.STORAGE_BASE_PATH || './storage';
+function defaultBasePath(): string {
+  if (process.env.STORAGE_BASE_PATH) return process.env.STORAGE_BASE_PATH;
+  // Vercel filesystem is ephemeral; keep uploads/exports under /tmp.
+  if (process.env.VERCEL === '1' || process.env.VERCEL === 'true') return '/tmp/storage';
+  return './storage';
+}
+
+const BASE_PATH = defaultBasePath();
 
 function ensureDir(dir: string): void {
   if (!fs.existsSync(dir)) {

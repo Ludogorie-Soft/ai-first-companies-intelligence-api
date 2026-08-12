@@ -1,4 +1,5 @@
 import PgBoss from 'pg-boss';
+import type { EmailLanguagePreference, ResolvedEmailLanguage } from './emailLanguage';
 
 export const QUEUES = {
   CRAWL_COMPANY:       'crawl-company',
@@ -13,6 +14,8 @@ export interface CrawlCompanyPayload {
   batchId: string;
   tenantId: string;
   templateId?: string;
+  /** Preferred language for Email Subject / Outreach Message / Campaign Email. */
+  emailLanguage?: EmailLanguagePreference;
 }
 
 export interface DiscoverPersonaPayload {
@@ -24,35 +27,69 @@ export interface DiscoverPersonaPayload {
   maxResults?: number;
   forceRecrawl?: boolean;
   templateId?: string;
+  emailLanguage?: EmailLanguagePreference;
 }
 
 export interface PersonalizeCompanyPayload {
   companyId: string;
+  tenantId?: string;
+  /** Already-resolved language for personalization prompts. */
+  emailLanguage?: ResolvedEmailLanguage;
 }
 
-let boss: PgBoss | null = null;
+const globalForBoss = globalThis as unknown as { __pgBoss?: PgBoss | null; __pgBossPromise?: Promise<PgBoss> | null };
+
+function isVercelRuntime(): boolean {
+  return process.env.VERCEL === '1' || process.env.VERCEL === 'true';
+}
+
+function queueConnectionString(): string {
+  return process.env.QUEUE_DATABASE_URL || process.env.DATABASE_URL || '';
+}
 
 export async function getQueue(): Promise<PgBoss> {
-  if (boss) return boss;
+  if (globalForBoss.__pgBoss) return globalForBoss.__pgBoss;
+  if (globalForBoss.__pgBossPromise) return globalForBoss.__pgBossPromise;
 
-  boss = new PgBoss({
-    connectionString: process.env.DATABASE_URL!,
-    retentionDays: 7,
-  });
+  const connectionString = queueConnectionString();
+  if (!connectionString) {
+    throw new Error('[pg-boss] DATABASE_URL or QUEUE_DATABASE_URL is required');
+  }
 
-  boss.on('error', (err) => {
-    console.error('[pg-boss] error:', err);
-  });
+  globalForBoss.__pgBossPromise = (async () => {
+    const vercel = isVercelRuntime();
+    const boss = new PgBoss({
+      connectionString,
+      retentionDays: 7,
+      // On Vercel the API only enqueues; the Mac worker runs supervise/schedule.
+      supervise: !vercel,
+      schedule: !vercel,
+      // Avoid opening a large pool per serverless isolate.
+      max: vercel ? 2 : undefined,
+    });
 
-  await boss.start();
+    boss.on('error', (err) => {
+      console.error('[pg-boss] error:', err);
+    });
 
-  // pg-boss v10 requires queues to be created before sending
-  await boss.createQueue(QUEUES.CRAWL_COMPANY);
-  await boss.createQueue(QUEUES.DISCOVER_PERSONA);
-  await boss.createQueue(QUEUES.PERSONALIZE_COMPANY);
+    await boss.start();
 
-  console.log('[pg-boss] started');
-  return boss;
+    // pg-boss v10 requires queues to be created before sending
+    await boss.createQueue(QUEUES.CRAWL_COMPANY);
+    await boss.createQueue(QUEUES.DISCOVER_PERSONA);
+    await boss.createQueue(QUEUES.PERSONALIZE_COMPANY);
+
+    console.log(`[pg-boss] started (vercel=${vercel}, supervise=${!vercel})`);
+    globalForBoss.__pgBoss = boss;
+    return boss;
+  })();
+
+  try {
+    return await globalForBoss.__pgBossPromise;
+  } catch (err) {
+    globalForBoss.__pgBossPromise = null;
+    throw err;
+  }
 }
 
 export async function enqueueCrawlJob(
@@ -93,8 +130,10 @@ export async function enqueuePersonalizeJob(
 }
 
 export async function stopQueue(): Promise<void> {
+  const boss = globalForBoss.__pgBoss;
   if (boss) {
     await boss.stop();
-    boss = null;
+    globalForBoss.__pgBoss = null;
+    globalForBoss.__pgBossPromise = null;
   }
 }

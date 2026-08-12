@@ -4,6 +4,18 @@ import { requireAuth } from '../../middleware/auth';
 
 const router = Router();
 
+const PROFILE_SELECT = {
+  name: true,
+  website: true,
+  contactPersonName: true,
+  contactPersonTitle: true,
+  contactPersonEmail: true,
+  contactPersonPhone: true,
+  aboutUs: true,
+  productsServices: true,
+  portfolio: true,
+} as const;
+
 /**
  * @openapi
  * /api/tenant/profile:
@@ -19,14 +31,7 @@ const router = Router();
 router.get('/profile', requireAuth, async (req: Request, res: Response): Promise<void> => {
   const tenant = await prisma.tenant.findUnique({
     where: { id: req.user.tenantId },
-    select: {
-      name: true,
-      website: true,
-      contactPersonName: true,
-      contactPersonTitle: true,
-      contactPersonEmail: true,
-      contactPersonPhone: true,
-    },
+    select: PROFILE_SELECT,
   });
 
   if (!tenant) {
@@ -64,6 +69,12 @@ router.get('/profile', requireAuth, async (req: Request, res: Response): Promise
  *                 type: string
  *               contactPersonPhone:
  *                 type: string
+ *               aboutUs:
+ *                 type: string
+ *               productsServices:
+ *                 type: string
+ *               portfolio:
+ *                 type: string
  *     responses:
  *       200:
  *         description: Updated tenant profile
@@ -73,6 +84,7 @@ router.put('/profile', requireAuth, async (req: Request, res: Response): Promise
     name, website,
     contactPersonName, contactPersonTitle,
     contactPersonEmail, contactPersonPhone,
+    aboutUs, productsServices, portfolio,
   } = req.body;
 
   const tenant = await prisma.tenant.update({
@@ -84,15 +96,11 @@ router.put('/profile', requireAuth, async (req: Request, res: Response): Promise
       ...(contactPersonTitle !== undefined ? { contactPersonTitle } : {}),
       ...(contactPersonEmail !== undefined ? { contactPersonEmail } : {}),
       ...(contactPersonPhone !== undefined ? { contactPersonPhone } : {}),
+      ...(aboutUs            !== undefined ? { aboutUs }            : {}),
+      ...(productsServices   !== undefined ? { productsServices }   : {}),
+      ...(portfolio          !== undefined ? { portfolio }          : {}),
     },
-    select: {
-      name: true,
-      website: true,
-      contactPersonName: true,
-      contactPersonTitle: true,
-      contactPersonEmail: true,
-      contactPersonPhone: true,
-    },
+    select: PROFILE_SELECT,
   });
 
   res.json(tenant);

@@ -895,6 +895,20 @@ function siteScript(pages: CrawledPage[]): Script {
   return frac > 0.50 ? 'cyrillic' : frac < 0.25 ? 'latin' : 'mixed';
 }
 
+/** Infer website language for email generation (Cyrillic-heavy → bg, otherwise en). */
+export function detectWebsiteLanguage(pages: CrawledPage[]): 'bg' | 'en' {
+  const script = siteScript(pages);
+  if (script === 'cyrillic') return 'bg';
+  if (script === 'latin') return 'en';
+  // Mixed / insufficient sample: prefer Bulgarian when any Cyrillic is present
+  let cyr = 0, lat = 0;
+  for (const p of pages) {
+    cyr += (p.text.match(/[Ѐ-ӿ]/g) ?? []).length;
+    lat += (p.text.match(/[a-zA-Z]/g) ?? []).length;
+  }
+  return cyr >= lat ? 'bg' : 'en';
+}
+
 function nameScript(name: string): Script {
   const cyr = (name.match(/[Ѐ-ӿ]/g) ?? []).length;
   const lat = (name.match(/[a-zA-Z]/g) ?? []).length;

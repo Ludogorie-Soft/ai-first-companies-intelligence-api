@@ -68,23 +68,15 @@ DATABASE_URL=
 JWT_SECRET=
 ```
 
-Optional:
+Optional (see `.env.example` for hybrid Vercel + Mac notes):
 
 ```env
+QUEUE_DATABASE_URL=
 GROQ_API_KEY=
 BRAVE_SEARCH_API_KEY=
-
-SERPER_API_KEY=
-
-EMAIL_HOST=
-EMAIL_PORT=
-EMAIL_USER=
-EMAIL_PASS=
-EMAIL_FROM=
-
+FRONTEND_URL=http://localhost:3000
 APP_URL=http://localhost:3001
-
-NODE_ENV=development
+STORAGE_BASE_PATH=./storage
 WORKER_CONCURRENCY=5
 ```
 
@@ -159,6 +151,84 @@ https://ai-first-companies-intelligence-api.onrender.com/docs
 
 ---
 
+# Hybrid deploy (Vercel API + Mac worker)
+
+The HTTP API can run on **Vercel Hobby** while crawl, persona discovery, and personalization run on an always-on machine (e.g. your Mac). Same GitHub repo — no separate worker project.
+
+```
+Browser / Frontend  →  Vercel (Express)  →  Neon (Prisma + pg-boss jobs)
+                                              ↑
+                         Mac: npm run start:worker (Playwright, Groq, Brave)
+```
+
+## Vercel (API only)
+
+1. Import this repository into a Vercel project.
+2. Set environment variables:
+
+| Variable | Notes |
+|----------|--------|
+| `DATABASE_URL` | Neon **pooler** URL |
+| `QUEUE_DATABASE_URL` | Neon **direct** URL (no `-pooler`) for pg-boss |
+| `JWT_SECRET` | Same secret as local / frontend expectations |
+| `FRONTEND_URL` | Exact frontend origin (CORS) |
+| `APP_URL` | Public API origin (email confirmation links) |
+| `STORAGE_BASE_PATH` | `/tmp/storage` |
+| `BREVO_API_KEY` / `EMAIL_FROM` | Verification emails |
+| `ENABLE_EMBEDDED_WORKER` | **Do not set** |
+
+`vercel.json` already skips Playwright browser download and builds with Prisma + Swagger + `tsc`. The entry is `api/index.ts`, which exports Express without importing the worker.
+
+3. After deploy, check `GET /health` (includes pending queue sizes) and `/docs`.
+
+## Mac (worker)
+
+Clone **this same repository** on the Mac:
+
+```bash
+git clone <this-repo-url>
+cd ai-first-companies-intelligence-api
+npm ci
+npx prisma generate
+npx playwright install chromium
+cp .env.example .env   # then edit
+npm run build
+npm run start:worker
+```
+
+Worker `.env` essentials:
+
+| Variable | Notes |
+|----------|--------|
+| `DATABASE_URL` | Same Neon DB (direct or pooler for Prisma) |
+| `QUEUE_DATABASE_URL` | Neon **direct** (recommended; same as Vercel) |
+| `GROQ_API_KEY` | Crawl enrichment / personalization / campaign email |
+| `BRAVE_SEARCH_API_KEY` | Persona discovery |
+| `WORKER_CONCURRENCY` | e.g. `5` |
+| `ENABLE_EMBEDDED_WORKER` | **Do not set** |
+
+No inbound ports or public URL are required. The worker polls Neon for pg-boss jobs enqueued by the Vercel API.
+
+### Keep the worker running
+
+- **pm2:** `pm2 start dist/worker/index.js --name ci-worker` then `pm2 save` / `pm2 startup`
+- **launchd:** a LaunchAgent that runs `node dist/worker/index.js` with `WorkingDirectory` set to the repo and `KeepAlive` true
+- Prevent sleep: System Settings → Energy → prevent automatic sleeping, or `caffeinate -dims &`
+
+If the Mac is offline, jobs remain in Neon and batches stay `PROCESSING` until the worker starts again.
+
+## Frontend
+
+Point the frontend at the Vercel API:
+
+```env
+NEXT_PUBLIC_API_URL=https://<your-api>.vercel.app
+```
+
+Do not rely on the local `next.config.ts` rewrite to `localhost:3001` for production.
+
+---
+
 # Main Features
 
 - JWT authentication
@@ -219,9 +289,11 @@ Domains are normalized automatically.
 npm run dev                 # API + Worker
 npm run dev:worker          # Worker only
 
-npm run build               # Production build
+npm run build               # Swagger + production build
+npm run build:swagger       # Regenerate OpenAPI JSON
 
 npm run start               # Start API
+npm run start:worker        # Start worker (Mac / Docker companion)
 
 npm run db:generate         # Prisma Client
 npm run db:migrate          # Prisma migrations

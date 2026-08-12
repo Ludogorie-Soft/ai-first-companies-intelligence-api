@@ -1,0 +1,10 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "version": 2,
+  "framework": null,
+  "installCommand": "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci",
+  "buildCommand": "prisma generate && npm run build",
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/api" }
+  ]
+}

@@ -3,6 +3,7 @@ import { prisma } from '../../lib/prisma';
 import { getQueue, enqueueDiscoverJob } from '../../lib/queue';
 import { requireAuth, requireVerified } from '../../middleware/auth';
 import { buildDiscoveryKey } from '../../services/discovery/discoveryKey';
+import { parseEmailLanguage } from '../../lib/emailLanguage';
 
 const router = Router();
 
@@ -34,6 +35,11 @@ const router = Router();
  *                 default: 20
  *                 minimum: 5
  *                 maximum: 50
+ *               emailLanguage:
+ *                 type: string
+ *                 enum: [bg, en, website]
+ *                 default: bg
+ *                 description: Language for Email Subject, Outreach Message, and Campaign Email
  *     responses:
  *       201:
  *         description: Search started, batch created
@@ -50,14 +56,16 @@ const router = Router();
  *         description: Weekly quota exceeded
  */
 router.post('/', requireAuth, requireVerified, async (req: Request, res: Response): Promise<void> => {
-  const { persona, location, keywords, maxResults: rawMax, force_recrawl, templateId: rawTemplateId } = req.body as {
+  const { persona, location, keywords, maxResults: rawMax, force_recrawl, templateId: rawTemplateId, emailLanguage: rawEmailLanguage } = req.body as {
     persona?: string;
     location?: string;
     keywords?: string;
     maxResults?: number;
     force_recrawl?: boolean;
     templateId?: string;
+    emailLanguage?: string;
   };
+  const emailLanguage = parseEmailLanguage(rawEmailLanguage);
 
   if (!persona?.trim() || !location?.trim()) {
     res.status(400).json({ error: 'persona and location are required' });
@@ -119,6 +127,7 @@ router.post('/', requireAuth, requireVerified, async (req: Request, res: Respons
           location: location.trim(),
           keywords: keywords?.trim() ?? '',
           maxResults,
+          emailLanguage,
         },
         discoveryKey,
         status: 'PROCESSING',
@@ -138,6 +147,7 @@ router.post('/', requireAuth, requireVerified, async (req: Request, res: Respons
         maxResults,
         forceRecrawl: Boolean(force_recrawl),
         templateId: resolvedTemplateId ?? undefined,
+        emailLanguage,
       },
       queue
     );

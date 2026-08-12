@@ -1,3 +1,9 @@
+import {
+  emailLanguageInstruction,
+  type ResolvedEmailLanguage,
+} from '../lib/emailLanguage';
+import { SENDER_TRUTHFULNESS_RULES } from '../lib/senderCompany';
+
 interface TeamMember {
   name: string;
   position?: string;
@@ -19,6 +25,12 @@ export interface CampaignEmailParams {
   senderContactTitle: string;
   senderContactEmail: string;
   senderContactPhone: string;
+  senderAboutUs?: string;
+  senderProductsServices?: string;
+  senderPortfolio?: string;
+
+  /** Resolved output language for the filled email (defaults to Bulgarian). */
+  emailLanguage?: ResolvedEmailLanguage;
 }
 
 type CallFn = (systemPrompt: string, userContent: string) => Promise<string>;
@@ -42,8 +54,12 @@ function buildPrompts(params: CampaignEmailParams, templateBody: string): { syst
   const targetContactPerson = contact
     ? `${contact.name}${contact.position ? ` (${contact.position})` : ''}`
     : 'не е намерен';
+  const lang = params.emailLanguage ?? 'bg';
 
-  const system = `You are a B2B outreach specialist. Fill in the provided email template using the company and sender data. Replace every {{placeholder}} tag with the matching value. Return only the final email text.`;
+  const system = `You are a B2B outreach specialist. Fill in the provided email template using the company and sender data. Replace every {{placeholder}} tag with the matching value. Return only the final email text. ${emailLanguageInstruction(lang)} If the template is in another language, translate the filled email into the required language while preserving meaning and tone.
+
+${SENDER_TRUTHFULNESS_RULES}
+When expanding placeholders or free text about the sender's offer, use ONLY SENDER About us / Products / Portfolio below. Do not invent experience or capabilities.`;
 
   const user = `TARGET COMPANY:
 - Name: ${params.targetName}
@@ -60,6 +76,9 @@ SENDER:
 - Title: ${params.senderContactTitle}
 - Email: ${params.senderContactEmail}
 - Phone: ${params.senderContactPhone}
+- About us: ${params.senderAboutUs?.trim() || '(not provided)'}
+- Products / services: ${params.senderProductsServices?.trim() || '(not provided)'}
+- Portfolio / case studies: ${params.senderPortfolio?.trim() || '(not provided)'}
 
 TEMPLATE:
 ---
