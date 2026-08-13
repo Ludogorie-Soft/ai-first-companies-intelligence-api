@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import { prisma } from '../../lib/prisma';
-import { sendConfirmationEmail } from '../../lib/email';
+import { isEmailConfigured, sendConfirmationEmail } from '../../lib/email';
 
 const router = Router();
 
@@ -78,10 +78,12 @@ router.post('/register', async (req: Request, res: Response): Promise<void> => {
     return { user, tenant };
   });
 
-  // Send confirmation email (non-blocking — don't fail registration if email fails)
-  sendConfirmationEmail(email, emailVerificationToken).catch((err) => {
-    console.error('[auth/register] Failed to send confirmation email:', err.message);
-  });
+  // Await email on serverless (Vercel) so the function stays alive until send completes.
+  try {
+    await sendConfirmationEmail(email, emailVerificationToken);
+  } catch (err) {
+    console.error('[auth/register] Failed to send confirmation email:', (err as Error).message);
+  }
 
   const token = jwt.sign(
     { sub: user.id, tenantId: tenant.id, email: user.email, emailVerified: user.emailVerified, role: user.role },
@@ -92,7 +94,7 @@ router.post('/register', async (req: Request, res: Response): Promise<void> => {
   // In development (non-production + no SMTP configured), return the verification URL directly
   // so developers can verify without needing real email delivery.
   // This field is NEVER included when NODE_ENV=production, regardless of EMAIL_HOST.
-  const isDevMode = process.env.NODE_ENV !== 'production' && !process.env.EMAIL_HOST;
+  const isDevMode = process.env.NODE_ENV !== 'production' && !isEmailConfigured();
   const appUrl = process.env.APP_URL || `http://localhost:${process.env.PORT || 3001}`;
   const devVerificationUrl = isDevMode
     ? `${appUrl}/api/auth/confirm-email?token=${emailVerificationToken}`

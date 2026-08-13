@@ -1,3 +1,5 @@
+import nodemailer from 'nodemailer';
+
 const BREVO_API_URL = 'https://api.brevo.com/v3/smtp/email';
 
 function parseSender(from: string): { email: string; name?: string } {
@@ -6,28 +8,45 @@ function parseSender(from: string): { email: string; name?: string } {
   return { email: from.trim() };
 }
 
+export function isEmailConfigured(): boolean {
+  return !!(process.env.BREVO_API_KEY || process.env.EMAIL_HOST);
+}
+
 export function logBrevoConfig(): void {
   const apiKey = process.env.BREVO_API_KEY;
+  const smtpHost = process.env.EMAIL_HOST;
   const from = process.env.EMAIL_FROM;
 
-  if (!apiKey) {
-    console.warn('[email] WARNING: BREVO_API_KEY is not set — email delivery disabled.');
-    console.warn('[email]   Running in console (dev) mode. Set BREVO_API_KEY + EMAIL_FROM to enable.');
+  if (apiKey) {
+    const maskedKey = `${apiKey.slice(0, 6)}***${apiKey.slice(-4)}`;
+    console.log('[email] Brevo API enabled');
+    console.log(`[email]   FROM=${from || '(not set)'}`);
+    console.log(`[email]   API_KEY=${maskedKey}`);
     return;
   }
 
-  const maskedKey = `${apiKey.slice(0, 6)}***${apiKey.slice(-4)}`;
-  console.log('[email] Brevo API enabled');
-  console.log(`[email]   FROM=${from || '(not set)'}`);
-  console.log(`[email]   API_KEY=${maskedKey}`);
+  if (smtpHost) {
+    console.log('[email] SMTP enabled');
+    console.log(`[email]   HOST=${smtpHost}:${process.env.EMAIL_PORT || '587'}`);
+    console.log(`[email]   USER=${process.env.EMAIL_USER || '(not set)'}`);
+    console.log(`[email]   FROM=${from || process.env.EMAIL_USER || '(not set)'}`);
+    return;
+  }
+
+  console.warn('[email] WARNING: no email provider configured — delivery disabled.');
+  console.warn('[email]   Set BREVO_API_KEY + EMAIL_FROM, or EMAIL_HOST + EMAIL_USER + EMAIL_PASS.');
 }
 
-export async function sendConfirmationEmail(email: string, token: string): Promise<void> {
+function buildConfirmationContent(token: string): {
+  confirmUrl: string;
+  subject: string;
+  text: string;
+  html: string;
+} {
   const appUrl = process.env.APP_URL || `http://localhost:${process.env.PORT || 3001}`;
   const confirmUrl = `${appUrl}/api/auth/confirm-email?token=${token}`;
-  const from = process.env.EMAIL_FROM || 'noreply@companies-intelligence.local';
-  const apiKey = process.env.BREVO_API_KEY;
-
+  const subject = 'Confirm your Companies Intelligence account';
+  const text = `Confirm your email address by visiting: ${confirmUrl}`;
   const html = `
 <!DOCTYPE html>
 <html>
@@ -60,22 +79,22 @@ export async function sendConfirmationEmail(email: string, token: string): Promi
 </body>
 </html>`;
 
-  if (!apiKey) {
-    console.log('[email] DEV MODE — printing verification URL to console (BREVO_API_KEY not configured):');
-    console.log(`[email]   To: ${email}`);
-    console.log(`[email]   Confirm URL: ${confirmUrl}`);
-    return;
-  }
+  return { confirmUrl, subject, text, html };
+}
 
-  console.log(`[email] sending verification email to ${email}`);
-
+async function sendViaBrevo(
+  email: string,
+  from: string,
+  apiKey: string,
+  content: ReturnType<typeof buildConfirmationContent>,
+): Promise<void> {
   const sender = parseSender(from);
   const payload = {
     sender,
     to: [{ email }],
-    subject: 'Confirm your Companies Intelligence account',
-    textContent: `Confirm your email address by visiting: ${confirmUrl}`,
-    htmlContent: html,
+    subject: content.subject,
+    textContent: content.text,
+    htmlContent: content.html,
   };
 
   let response: Response;
@@ -101,6 +120,65 @@ export async function sendConfirmationEmail(email: string, token: string): Promi
     console.error(`[email] verification email failed: ${err.message}`);
     throw err;
   }
+}
 
-  console.log(`[email] verification email sent`);
+async function sendViaSmtp(
+  email: string,
+  from: string,
+  content: ReturnType<typeof buildConfirmationContent>,
+): Promise<void> {
+  const host = process.env.EMAIL_HOST;
+  const user = process.env.EMAIL_USER;
+  const pass = process.env.EMAIL_PASS;
+
+  if (!host || !user || !pass) {
+    throw new Error('EMAIL_HOST, EMAIL_USER, and EMAIL_PASS are required for SMTP');
+  }
+
+  const port = parseInt(process.env.EMAIL_PORT || '587', 10);
+  const secure =
+    process.env.EMAIL_SECURE === 'true' ||
+    process.env.EMAIL_SECURE === '1' ||
+    port === 465;
+
+  const transporter = nodemailer.createTransport({
+    host,
+    port,
+    secure,
+    auth: { user, pass },
+  });
+
+  await transporter.sendMail({
+    from,
+    to: email,
+    subject: content.subject,
+    text: content.text,
+    html: content.html,
+  });
+}
+
+export async function sendConfirmationEmail(email: string, token: string): Promise<void> {
+  const from =
+    process.env.EMAIL_FROM ||
+    process.env.EMAIL_USER ||
+    'noreply@companies-intelligence.local';
+  const apiKey = process.env.BREVO_API_KEY;
+  const content = buildConfirmationContent(token);
+
+  if (!apiKey && !process.env.EMAIL_HOST) {
+    console.log('[email] DEV MODE — no provider configured; verification URL:');
+    console.log(`[email]   To: ${email}`);
+    console.log(`[email]   Confirm URL: ${content.confirmUrl}`);
+    return;
+  }
+
+  console.log(`[email] sending verification email to ${email} via ${apiKey ? 'Brevo' : 'SMTP'}`);
+
+  if (apiKey) {
+    await sendViaBrevo(email, from, apiKey, content);
+  } else {
+    await sendViaSmtp(email, from, content);
+  }
+
+  console.log('[email] verification email sent');
 }
