@@ -2,9 +2,9 @@ import fs from 'fs';
 import path from 'path';
 
 function defaultBasePath(): string {
-  if (process.env.STORAGE_BASE_PATH) return process.env.STORAGE_BASE_PATH;
-  // Vercel filesystem is ephemeral; keep uploads/exports under /tmp.
+  // Vercel only allows writes under /tmp — ignore STORAGE_BASE_PATH (/app/storage from Docker).
   if (process.env.VERCEL === '1' || process.env.VERCEL === 'true') return '/tmp/storage';
+  if (process.env.STORAGE_BASE_PATH) return process.env.STORAGE_BASE_PATH;
   return './storage';
 }
 
