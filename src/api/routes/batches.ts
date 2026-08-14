@@ -7,8 +7,14 @@ import fs from 'fs';
 import { prisma } from '../../lib/prisma';
 import { StorageService } from '../../services/storage';
 import { getQueue, enqueueCrawlJob } from '../../lib/queue';
-import { isNonCrawlablePlatform } from '../../services/nonCrawlablePlatforms';
+import { isNonCrawlablePlatform, NON_CRAWLABLE_PLATFORM_NOTE } from '../../services/nonCrawlablePlatforms';
 import { checkFreshness } from '../../lib/freshness';
+import {
+  computeProgress,
+  getBatchCounts,
+  getBatchCountsMany,
+  refreshBatchProgress,
+} from '../../lib/batchProgress';
 import { requireAuth, requireVerified } from '../../middleware/auth';
 import { ExportService } from '../../services/export';
 import { emailLanguageFromSearchQuery } from '../../lib/emailLanguage';
@@ -99,7 +105,21 @@ router.get('/', requireAuth, async (req: Request, res: Response): Promise<void> 
       orderBy: { createdAt: 'desc' },
       take: 100,
     });
-    res.json(batches);
+
+    // Progress is derived, never read from the stored counters — see lib/batchProgress.ts.
+    // Two grouped queries for the whole page, not one per batch.
+    const counts = await getBatchCountsMany(tenantId, batches.map(b => b.id));
+
+    res.json(batches.map(batch => {
+      const progress = computeProgress(batch.status, counts.get(batch.id) ?? { total: 0, done: 0 });
+      // Only the numeric fields — the persisted status wins on read.
+      return {
+        ...batch,
+        totalCompanies:       progress.totalCompanies,
+        processedCompanies:   progress.processedCompanies,
+        completionPercentage: progress.completionPercentage,
+      };
+    }));
   } catch (err) {
     console.error('[batches/list]', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -276,54 +296,76 @@ router.post(
 
       const queue = await getQueue();
 
-      // Process all domains in parallel — avoids N×3 sequential DB roundtrips.
-      const jobResults = await Promise.all(domains.map(async (domain) => {
-        const baseUrl = buildBaseUrl(domain);
-
-        const company = await prisma.company.upsert({
+      // ── Phase 1: upsert every Company row in parallel ────────────────────────
+      const companies = await Promise.all(domains.map((domain) =>
+        prisma.company.upsert({
           where: { domain },
-          create: { domain, baseUrl },
+          create: { domain, baseUrl: buildBaseUrl(domain) },
           update: {},
           include: { profile: true },
-        });
+        }),
+      ));
 
-        await prisma.tenantCompany.createMany({
-          data: [{ tenantId, companyId: company.id, sourceBatchId: batch.id }],
-          skipDuplicates: true,
-        });
+      const nonCrawlable: typeof companies = [];
+      const toEnqueue: typeof companies = [];
 
-        if (isNonCrawlablePlatform(domain)) {
-          console.log(`[enqueue] skipped ${domain} reason=non_crawlable_platform`);
-          return false;
+      for (const company of companies) {
+        if (isNonCrawlablePlatform(company.domain)) {
+          console.log(`[enqueue] skipped ${company.domain} reason=non_crawlable_platform`);
+          nonCrawlable.push(company);
+          continue;
         }
 
         const freshness = checkFreshness(company, forceRecrawl);
-
         if (freshness.skip) {
-          console.log(`[upload] skipped fresh company ${domain} — ${freshness.reason}`);
-          return false;
+          console.log(`[upload] skipped fresh company ${company.domain} — ${freshness.reason}`);
+        } else {
+          console.log(`[upload] recrawling ${company.domain} — ${freshness.reason}`);
+          toEnqueue.push(company);
         }
+      }
 
-        console.log(`[upload] recrawling ${domain} — ${freshness.reason}`);
+      // ── Phase 2: correct pre-crawl state, then seed the batch in one write ───
+      // Non-crawlable domains never get a job, so they must be parked in a terminal
+      // crawlStatus or the batch could never reach 100%.
+      if (nonCrawlable.length > 0) {
+        await prisma.company.updateMany({
+          where: { id: { in: nonCrawlable.map(c => c.id) }, crawlStatus: { not: 'COMPLETED' } },
+          data:  { crawlStatus: 'BLOCKED', crawlNote: NON_CRAWLABLE_PLATFORM_NOTE },
+        });
+      }
+      // checkFreshness re-enqueues already-COMPLETED companies whose profile is too thin;
+      // without this reset they would count as done the instant the batch is seeded.
+      if (toEnqueue.length > 0) {
+        await prisma.company.updateMany({
+          where: { id: { in: toEnqueue.map(c => c.id) } },
+          data:  { crawlStatus: 'PENDING' },
+        });
+      }
+
+      await prisma.tenantCompany.createMany({
+        data: companies.map(c => ({ tenantId, companyId: c.id, sourceBatchId: batch.id })),
+        skipDuplicates: true,
+      });
+
+      // ── Phase 3: enqueue, then derive progress once ─────────────────────────
+      for (const company of toEnqueue) {
         await enqueueCrawlJob(
-          { companyId: company.id, domain, baseUrl, batchId: batch.id, tenantId, templateId: resolvedTemplateId ?? undefined },
+          {
+            companyId: company.id,
+            domain: company.domain,
+            baseUrl: company.baseUrl,
+            batchId: batch.id,
+            tenantId,
+            templateId: resolvedTemplateId ?? undefined,
+          },
           queue,
         );
-        return true;
-      }));
+      }
 
-      const jobsEnqueued = jobResults.filter(Boolean).length;
+      const jobsEnqueued = toEnqueue.length;
 
-      // Update batch completion percentage
-      const processed = domains.length - jobsEnqueued;
-      await prisma.crawlBatch.update({
-        where: { id: batch.id },
-        data: {
-          processedCompanies: processed,
-          completionPercentage: (processed / domains.length) * 100,
-          status: jobsEnqueued === 0 ? 'COMPLETED' : 'PROCESSING',
-        },
-      });
+      await refreshBatchProgress(batch.id, tenantId);
 
       // Increment tenant usage — charge full domains.length, not just enqueued jobs,
       // since cached-domain skips still count against the quota check above.
@@ -390,12 +432,15 @@ router.get('/:id', requireAuth, async (req: Request, res: Response): Promise<voi
       return;
     }
 
-    // Recalculate completion percentage from DB
-    const processed = batch.processedCompanies;
-    const total = batch.totalCompanies;
-    const percentage = total > 0 ? (processed / total) * 100 : 0;
+    // Derived from live rows, identical to what GET /batches returns for this batch.
+    const progress = computeProgress(batch.status, await getBatchCounts(tenantId, id));
 
-    res.json({ ...batch, completionPercentage: percentage });
+    res.json({
+      ...batch,
+      totalCompanies:       progress.totalCompanies,
+      processedCompanies:   progress.processedCompanies,
+      completionPercentage: progress.completionPercentage,
+    });
   } catch (err) {
     console.error('[batches/:id]', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -604,6 +649,13 @@ router.patch('/:id/candidates/:domain', requireAuth, async (req: Request, res: R
     }
 
     if (action === 'exclude') {
+      // Already excluded — nothing to do. Without this guard a repeated call used to
+      // decrement totalCompanies again, driving it below the real row count.
+      if (candidate.status === 'EXCLUDED') {
+        res.json({ ok: true });
+        return;
+      }
+
       // KEPT → EXCLUDED: mark candidate + mark tenantCompany as excluded
       await prisma.discoveryCandidate.update({
         where: { batchId_domain: { batchId, domain } },
@@ -617,10 +669,9 @@ router.patch('/:id/candidates/:domain', requireAuth, async (req: Request, res: R
         },
         data: { excluded: true },
       });
-      await prisma.crawlBatch.update({
-        where: { id: batchId },
-        data: { totalCompanies: { decrement: 1 } },
-      });
+      // Excluding drops the row from both numerator and denominator at once — this is
+      // where the old decrement-only counter produced percentages above 100.
+      await refreshBatchProgress(batchId, tenantId);
       res.json({ ok: true });
     } else {
       // include: two cases
@@ -634,10 +685,7 @@ router.patch('/:id/candidates/:domain', requireAuth, async (req: Request, res: R
           where: { tenantId, sourceBatchId: batchId, company: { domain } },
           data: { excluded: false },
         });
-        await prisma.crawlBatch.update({
-          where: { id: batchId },
-          data: { totalCompanies: { increment: 1 } },
-        });
+        await refreshBatchProgress(batchId, tenantId);
         res.json({ ok: true });
       } else {
         // FILTERED or BLOCKED → KEPT: upsert company + tenantCompany, enqueue crawl
@@ -655,15 +703,30 @@ router.patch('/:id/candidates/:domain', requireAuth, async (req: Request, res: R
           where: { batchId_domain: { batchId, domain } },
           data: { status: 'KEPT' },
         });
-        await prisma.crawlBatch.update({
-          where: { id: batchId },
-          data: { totalCompanies: { increment: 1 } },
-        });
+
         if (isNonCrawlablePlatform(domain)) {
           console.log(`[enqueue] skipped ${domain} reason=non_crawlable_platform`);
+          // Park it terminally — it gets no job, so it must not hold the batch below 100%.
+          await prisma.company.update({
+            where: { id: company.id },
+            data:  { crawlStatus: 'BLOCKED', crawlNote: NON_CRAWLABLE_PLATFORM_NOTE },
+          });
+          await refreshBatchProgress(batchId, tenantId);
           res.json({ ok: true, crawlTriggered: false, reason: 'non_crawlable_platform' });
           return;
         }
+
+        // Adding work to a finished batch must reopen it — progress is frozen on terminal
+        // batches, so without this the new company would never be reflected.
+        await prisma.company.update({
+          where: { id: company.id },
+          data:  { crawlStatus: 'PENDING' },
+        });
+        await prisma.crawlBatch.update({
+          where: { id: batchId },
+          data:  { status: 'PROCESSING' },
+        });
+        await refreshBatchProgress(batchId, tenantId);
 
         const queue = await getQueue();
         await enqueueCrawlJob(
@@ -738,25 +801,42 @@ router.post('/:id/re-enrich', requireAuth, requireVerified, async (req: Request,
       return;
     }
 
-    // Reset batch progress — all companies will be re-crawled
+    const nonCrawlable = companies.filter(c => isNonCrawlablePlatform(c.domain));
+    const toEnqueue    = companies.filter(c => !isNonCrawlablePlatform(c.domain));
+
+    // Non-crawlable domains get no job. They used to be counted in the denominator while
+    // never reaching a terminal state, so the batch stayed PROCESSING forever and the
+    // dashboard polled every 3s indefinitely. Park them as BLOCKED instead.
+    if (nonCrawlable.length > 0) {
+      for (const c of nonCrawlable) {
+        console.log(`[enqueue] skipped ${c.domain} reason=non_crawlable_platform`);
+      }
+      await prisma.company.updateMany({
+        where: { id: { in: nonCrawlable.map(c => c.id) }, crawlStatus: { not: 'COMPLETED' } },
+        data:  { crawlStatus: 'BLOCKED', crawlNote: NON_CRAWLABLE_PLATFORM_NOTE },
+      });
+    }
+
+    // Reset the companies actually being re-crawled, or they would read as already done.
+    if (toEnqueue.length > 0) {
+      await prisma.company.updateMany({
+        where: { id: { in: toEnqueue.map(c => c.id) } },
+        data:  { crawlStatus: 'PENDING' },
+      });
+    }
+
+    // Reopen before refreshing — progress is frozen on terminal batches, so a refresh
+    // ahead of this would be a no-op.
     await prisma.crawlBatch.update({
       where: { id },
-      data: {
-        processedCompanies:   0,
-        completionPercentage: 0,
-        totalCompanies:       companies.length,
-        status:               'PROCESSING',
-      },
+      data:  { status: 'PROCESSING' },
     });
+    const progress = await refreshBatchProgress(id, tenantId);
 
     // Enqueue crawl jobs directly — bypasses the 30-day deduplication check
     // that lives only in the upload route, not in the worker
     const queue = await getQueue();
-    for (const company of companies) {
-      if (isNonCrawlablePlatform(company.domain)) {
-        console.log(`[enqueue] skipped ${company.domain} reason=non_crawlable_platform`);
-        continue;
-      }
+    for (const company of toEnqueue) {
       await enqueueCrawlJob(
         {
           companyId: company.id,
@@ -771,7 +851,13 @@ router.post('/:id/re-enrich', requireAuth, requireVerified, async (req: Request,
       );
     }
 
-    res.json({ batchId: id, reEnqueuedCompanies: companies.length, status: 'PROCESSING' });
+    // Report what was actually enqueued — non-crawlable domains get no job, and the old
+    // count overstated the work by including them.
+    res.json({
+      batchId: id,
+      reEnqueuedCompanies: toEnqueue.length,
+      status: progress?.status ?? 'PROCESSING',
+    });
   } catch (err) {
     console.error('[batches/:id/re-enrich]', err);
     res.status(500).json({ error: 'Internal server error' });

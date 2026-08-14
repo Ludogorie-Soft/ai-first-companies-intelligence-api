@@ -4,6 +4,7 @@ import { normalizeRawProfileUrl } from '../lib/normalizeRawProfileUrl';
 import { rawProfileCacheDecision } from '../lib/rawProfileCache';
 import { getQueue, QUEUES, CrawlCompanyPayload, DiscoverPersonaPayload, PersonalizeCompanyPayload, enqueueCrawlJob, enqueuePersonalizeJob, stopQueue } from '../lib/queue';
 import { prisma } from '../lib/prisma';
+import { refreshBatchProgress } from '../lib/batchProgress';
 import { crawlCompany, detectBotProtection, BOT_CRAWL_NOTE } from './crawl';
 import { extractProfile, isGenericAuthName, detectWebsiteLanguage } from '../services/extraction';
 import { enrichSocialLinks } from '../services/socialEnrichment';
@@ -26,7 +27,21 @@ const CONCURRENCY = parseInt(process.env.WORKER_CONCURRENCY || '5', 10);
 
 async function processJob(jobs: PgBoss.JobWithMetadata<CrawlCompanyPayload>[]): Promise<void> {
   for (const job of jobs) {
-    await processSingleJob(job);
+    try {
+      await processSingleJob(job);
+    } catch (err) {
+      // Fail only this job. Letting the error escape the handler makes pg-boss fail the
+      // ENTIRE batch of `batchSize` jobs, forcing siblings that already crawled
+      // successfully through a full re-crawl (Playwright + validation + LLM) on retry.
+      try {
+        const boss = await getQueue();
+        await boss.fail(QUEUES.CRAWL_COMPANY, job.id, {
+          message: err instanceof Error ? err.message : String(err),
+        });
+      } catch (failErr) {
+        console.error(`[worker] could not mark job ${job.id} failed:`, failErr);
+      }
+    }
   }
 }
 
@@ -43,7 +58,7 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
       where: { id: companyId },
       data: { crawlStatus: 'BLOCKED', crawlNote: NON_CRAWLABLE_PLATFORM_NOTE },
     });
-    await updateBatchProgress(batchId);
+    await refreshBatchProgress(batchId, tenantId);
     return;
   }
 
@@ -63,7 +78,7 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
         where: { id: companyId },
         data: { crawlStatus: 'FAILED' },
       });
-      await updateBatchProgress(batchId);
+      await refreshBatchProgress(batchId, tenantId);
       console.log(`[worker] skipped ${domain} — unreachable (no pages)`);
       return;
     }
@@ -75,7 +90,7 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
         where: { id: companyId },
         data: { crawlStatus: 'BLOCKED', crawlNote: BOT_CRAWL_NOTE },
       });
-      await updateBatchProgress(batchId);
+      await refreshBatchProgress(batchId, tenantId);
       console.log(`[worker] blocked ${domain} — bot protection detected (${indicator})`);
       return;
     }
@@ -445,7 +460,7 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
     });
 
     console.log(`[worker] done ${domain} — score: ${upsertScore}`);
-    await updateBatchProgress(batchId);
+    await refreshBatchProgress(batchId, tenantId);
 
     // 6. Enqueue personalization — best-effort; failure must not cause a crawl retry or FAILED status
     try {
@@ -485,7 +500,7 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
           ...(hasUsefulData ? { lastCrawledAt: new Date() } : {}),
         },
       });
-      await updateBatchProgress(batchId);
+      await refreshBatchProgress(batchId, tenantId);
     } else {
       await prisma.company.updateMany({
         where: { id: companyId, crawlStatus: { not: 'COMPLETED' } },
@@ -495,36 +510,6 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
 
     throw err; // Let pg-boss handle retry
   }
-}
-
-async function updateBatchProgress(batchId: string): Promise<void> {
-  // Atomic increment — avoids read-modify-write race with concurrent workers
-  let batch: { totalCompanies: number; processedCompanies: number };
-  try {
-    batch = await prisma.crawlBatch.update({
-      where: { id: batchId },
-      data: { processedCompanies: { increment: 1 } },
-      select: { totalCompanies: true, processedCompanies: true },
-    });
-  } catch (err: unknown) {
-    // Batch was deleted or never existed — skip progress update silently.
-    // A missing batch must not propagate as a crawl failure.
-    if ((err as { code?: string }).code === 'P2025') {
-      console.warn(`[worker] batch ${batchId} not found; skipping progress update`);
-      return;
-    }
-    throw err;
-  }
-
-  const percentage = batch.totalCompanies > 0
-    ? (batch.processedCompanies / batch.totalCompanies) * 100
-    : 0;
-  const status = batch.processedCompanies >= batch.totalCompanies ? 'COMPLETED' : 'PROCESSING';
-
-  await prisma.crawlBatch.update({
-    where: { id: batchId },
-    data: { completionPercentage: percentage, status },
-  });
 }
 
 // ── Shared crawl enqueue helper ───────────────────────────────────────────────
@@ -556,53 +541,66 @@ async function enqueueCrawlsFromEntries(
     return;
   }
 
-  await prisma.crawlBatch.update({
-    where: { id: batchId },
-    data:  { totalCompanies: crawlable.length },
-  });
-
-  let jobsEnqueued = 0;
-  let skippedFresh = 0;
-
-  for (const entry of crawlable) {
-    const { domain, name } = entry;
-    const baseUrl = `https://${domain}`;
-
-    const company = await prisma.company.upsert({
-      where:   { domain },
-      create:  { domain, baseUrl, name: name ?? null },
+  // ── Phase 1: upsert every Company row ───────────────────────────────────────
+  const companies = await Promise.all(crawlable.map(entry =>
+    prisma.company.upsert({
+      where:   { domain: entry.domain },
+      create:  { domain: entry.domain, baseUrl: `https://${entry.domain}`, name: entry.name ?? null },
       update:  {},
       include: { profile: true },
-    });
+    }),
+  ));
 
-    await prisma.tenantCompany.createMany({
-      data: [{ tenantId, companyId: company.id, sourceBatchId: batchId }],
-      skipDuplicates: true,
-    });
+  const toEnqueue: typeof companies = [];
+  let skippedFresh = 0;
 
-    // Queue protection: non-crawlable platforms must never enter the crawl pipeline.
-    if (isNonCrawlablePlatform(domain)) {
-      console.log(`[enqueue] skipped ${domain} reason=non_crawlable_platform`);
-      platformMetrics.crawlJobsSkipped++;
-      await updateBatchProgress(batchId);
-      continue;
-    }
-
+  for (const company of companies) {
     const freshness = checkFreshness(company, forceRecrawl);
-
     if (freshness.skip) {
-      console.log(`[discover] skipped fresh company ${domain} — ${freshness.reason}`);
+      console.log(`[discover] skipped fresh company ${company.domain} — ${freshness.reason}`);
       skippedFresh++;
-      await updateBatchProgress(batchId);
     } else {
-      console.log(`[discover] enqueued crawl for candidate ${domain} — ${freshness.reason}`);
-      await enqueueCrawlJob(
-        { companyId: company.id, domain, baseUrl, batchId, tenantId, templateId, emailLanguage },
-        crawlQueue,
-      );
-      jobsEnqueued++;
+      console.log(`[discover] enqueued crawl for candidate ${company.domain} — ${freshness.reason}`);
+      toEnqueue.push(company);
     }
   }
+
+  // ── Phase 2: put every company into a correct pre-crawl state, then seed ─────
+  // Company.crawlStatus is global, and checkFreshness enqueues an already-COMPLETED company
+  // whenever its stored profile is too thin. Without this reset those rows would read as
+  // already done the moment the batch is seeded.
+  if (toEnqueue.length > 0) {
+    await prisma.company.updateMany({
+      where: { id: { in: toEnqueue.map(c => c.id) } },
+      data:  { crawlStatus: 'PENDING' },
+    });
+  }
+
+  // One createMany, after the reset — progress is derived from these rows, so they must
+  // become visible all at once and only once their crawlStatus is accurate. A read landing
+  // before this sees total=0 (→ 0%, PROCESSING) rather than a spuriously complete batch.
+  await prisma.tenantCompany.createMany({
+    data: companies.map(c => ({ tenantId, companyId: c.id, sourceBatchId: batchId })),
+    skipDuplicates: true,
+  });
+
+  // ── Phase 3: enqueue, then refresh progress exactly once ────────────────────
+  for (const company of toEnqueue) {
+    await enqueueCrawlJob(
+      {
+        companyId: company.id,
+        domain:    company.domain,
+        baseUrl:   company.baseUrl,
+        batchId,
+        tenantId,
+        templateId,
+        emailLanguage,
+      },
+      crawlQueue,
+    );
+  }
+
+  const jobsEnqueued = toEnqueue.length;
 
   if (jobsEnqueued > 0) {
     await prisma.tenant.update({
@@ -610,6 +608,8 @@ async function enqueueCrawlsFromEntries(
       data:  { weeklyUsage: { increment: jobsEnqueued } },
     });
   }
+
+  await refreshBatchProgress(batchId, tenantId);
 
   console.log(`[worker/discover] enqueued=${jobsEnqueued} skippedFresh=${skippedFresh} for batch ${batchId}`);
 }
