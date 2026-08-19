@@ -5,7 +5,8 @@ import { rawProfileCacheDecision } from '../lib/rawProfileCache';
 import { getQueue, QUEUES, CrawlCompanyPayload, DiscoverPersonaPayload, PersonalizeCompanyPayload, enqueueCrawlJob, enqueuePersonalizeJob, stopQueue } from '../lib/queue';
 import { prisma } from '../lib/prisma';
 import { refreshBatchProgress } from '../lib/batchProgress';
-import { crawlCompany, detectBotProtection, BOT_CRAWL_NOTE } from './crawl';
+import { crawlCompanyDetailed, detectBotProtection, BOT_CRAWL_NOTE } from './crawl';
+import { crawlNoteFor } from './crawlErrors';
 import { extractProfile, isGenericAuthName, detectWebsiteLanguage } from '../services/extraction';
 import { enrichSocialLinks } from '../services/socialEnrichment';
 import { enrichAddress } from '../services/addressEnrichment';
@@ -72,16 +73,22 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
 
   try {
     // 1. Crawl pages
-    const pages = await crawlCompany(baseUrl);
+    const { pages, failure } = await crawlCompanyDetailed(baseUrl);
 
     if (pages.length === 0) {
-      // Host is unreachable — mark failed immediately, no retry
+      // Host produced nothing. `failure` names the cause when the crawler could
+      // classify it, so the UI can say "domain does not resolve" instead of a
+      // bare FAILED, and so a cause that cannot change between attempts does
+      // not get retried by pg-boss.
       await prisma.company.update({
         where: { id: companyId },
-        data: { crawlStatus: 'FAILED' },
+        data: { crawlStatus: 'FAILED', crawlNote: failure ? crawlNoteFor(failure) ?? null : null },
       });
       await refreshBatchProgress(batchId, tenantId);
-      console.log(`[worker] skipped ${domain} — unreachable (no pages)`);
+      console.log(
+        `[worker] skipped ${domain} — unreachable (no pages)` +
+        (failure ? ` code=${failure.code} retryable=${failure.retryable}` : ''),
+      );
       return;
     }
 
@@ -851,6 +858,33 @@ async function processPersonalizeJob(
   console.log(`[worker/personalize] Saved content for ${companyId}`);
 }
 
+/**
+ * One startup line stating whether the Playwright browser is actually present.
+ *
+ * A worker whose Chromium was never installed (or was installed for a
+ * different playwright version after an `npm install`) fails per-URL, deep
+ * inside the crawler, with a message nobody sees. Checking once at boot turns
+ * that whole class of failure into an actionable banner.
+ */
+async function reportChromiumAvailability(): Promise<void> {
+  try {
+    const { chromium } = await import('playwright');
+    // A real launch, not an executablePath() existence check: crawlee launches
+    // the `chromium_headless_shell` build, which lives at a different path from
+    // the one executablePath() reports, so a file check can pass while the
+    // actual launch still fails.
+    const browser = await chromium.launch({ headless: true });
+    await browser.close();
+    console.log(`[worker] chromium=ok (${chromium.executablePath()})`);
+  } catch (err) {
+    console.error(
+      '[worker] CHROMIUM UNAVAILABLE — every Playwright fallback crawl will fail. ' +
+      'Run: npx playwright install chromium' + '\n         ' +
+      (err instanceof Error ? err.message.split('\n')[0] : String(err)),
+    );
+  }
+}
+
 let workerStarted = false;
 
 export async function startWorker(): Promise<void> {
@@ -861,6 +895,7 @@ export async function startWorker(): Promise<void> {
   workerStarted = true;
 
   console.log('[worker] starting...');
+  await reportChromiumAvailability();
   const queue = await getQueue();
 
   queue.work<CrawlCompanyPayload>(
