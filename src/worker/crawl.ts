@@ -6,8 +6,11 @@ import { extractPhones } from '../lib/phoneExtraction';
 import { detectLoginPage } from '../services/loginDetection';
 import { extractLogoUrls } from '../services/logoExtraction';
 import { ClickedContact, extractClickedContacts, TEAM_CARD_SELECTORS } from '../lib/teamInteraction';
+import { classifyCrawlError, resolvesInDns, CrawlErrorInfo } from './crawlErrors';
+import type { Page as PlaywrightPage } from 'playwright';
 
 export type { ClickedContact };
+export type { CrawlErrorInfo };
 
 export interface CrawledPage {
   url: string;
@@ -182,6 +185,71 @@ function makeConfig(): Configuration {
   return new Configuration({ storageClient: new MemoryStorage({ persistStorage: false }) });
 }
 
+// ── Crawl context ────────────────────────────────────────────────────────────
+// crawlCompany races the whole pipeline against CRAWL_TIMEOUT_MS. Losing that
+// race used to leave the crawler — and its Chromium — running: the worker moved
+// on to the next job while an orphaned browser stayed resident. Across a batch
+// those accumulate until memory pressure makes healthy sites start timing out
+// too. Every crawler registers here so the timeout path can tear it down.
+
+interface Teardownable { teardown(): Promise<void>; }
+
+interface CrawlContext {
+  live: Set<Teardownable>;
+  /** First classified failure seen, used to explain an empty result. */
+  firstFailure?: CrawlErrorInfo;
+}
+
+function newContext(): CrawlContext {
+  return { live: new Set() };
+}
+
+async function teardownAll(ctx: CrawlContext): Promise<void> {
+  const crawlers = [...ctx.live];
+  ctx.live.clear();
+  if (crawlers.length === 0) return;
+  await Promise.allSettled(crawlers.map((c) => c.teardown()));
+}
+
+/** Runs a crawler with the context registration/cleanup around it. */
+async function runTracked(ctx: CrawlContext, crawler: Teardownable & { run(urls: string[]): Promise<unknown> }, urls: string[]): Promise<void> {
+  ctx.live.add(crawler);
+  try {
+    await crawler.run(urls);
+  } finally {
+    ctx.live.delete(crawler);
+  }
+}
+
+/**
+ * Single log shape for every failed request, across both engines.
+ *
+ * The previous `Playwright failed: <url>` line dropped the error entirely, so a
+ * dead domain, an expired certificate, a navigation timeout and a missing
+ * Chromium all printed identically. The `code=` token is what makes a failure
+ * diagnosable from the worker log alone.
+ */
+function firstLine(message: string): string {
+  const nl = message.indexOf('\n');
+  return nl === -1 ? message : message.slice(0, nl);
+}
+
+function logFailure(
+  ctx: CrawlContext,
+  engine: string,
+  url: string,
+  err: unknown,
+  retryCount = 0,
+  maxRetries = 0,
+): void {
+  const info = classifyCrawlError(err);
+  ctx.firstFailure ??= info;
+  console.error(
+    `[crawl:fail] ${engine} ${url} code=${info.code} retry=${retryCount}/${maxRetries} — ` +
+    firstLine(info.message).slice(0, 300),
+  );
+}
+
 // Strip <script>, <style>, and <noscript> before extracting visible text so
 // JSON-LD, inline JS, and CSS never bleed into extraction (e.g. location, emails).
 function pageText($: cheerio.CheerioAPI): string {
@@ -190,7 +258,7 @@ function pageText($: cheerio.CheerioAPI): string {
   return $clean.root().text();
 }
 
-async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
+async function crawlWithCheerio(baseUrl: string, ctx: CrawlContext): Promise<CrawledPage[]> {
   const pages: CrawledPage[] = [];
   let homepageHtml = '';
 
@@ -198,6 +266,9 @@ async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
     {
       maxRequestsPerCrawl: 1,
       requestHandlerTimeoutSecs: 20,
+      // Default is 3. A homepage that failed twice fails the third time too,
+      // and every extra attempt eats the shared CRAWL_TIMEOUT_MS budget.
+      maxRequestRetries: 1,
       async requestHandler({ $, request, body }) {
         homepageHtml = body.toString();
         const text = pageText($ as unknown as cheerio.CheerioAPI);
@@ -215,14 +286,14 @@ async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
           logoUrls,
         });
       },
-      failedRequestHandler({ request, log }) {
-        log.error(`Failed: ${request.url}`);
+      failedRequestHandler({ request }, error) {
+        logFailure(ctx, 'cheerio:first', request.url, error, request.retryCount, 1);
       },
     },
     makeConfig()
   );
 
-  await firstPass.run([baseUrl]);
+  await runTracked(ctx, firstPass, [baseUrl]);
   if (pages.length === 0) return pages;
 
   const queue = buildUrlQueue(homepageHtml, baseUrl);
@@ -242,6 +313,9 @@ async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
       maxRequestsPerCrawl: urlsToVisit.length,
       requestHandlerTimeoutSecs: 10,
       navigationTimeoutSecs: 10,
+      // These URLs are largely guesses (CONTACT_PATHS / TEAM_PATHS fallbacks).
+      // Retrying a path that does not exist three times is pure waste.
+      maxRequestRetries: 0,
       async requestHandler({ $, request }) {
         const text = pageText($ as unknown as cheerio.CheerioAPI);
         const html = $.html();
@@ -260,12 +334,14 @@ async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
           logoUrls,
         });
       },
-      failedRequestHandler() { /* silent */ },
+      failedRequestHandler({ request }, error) {
+        logFailure(ctx, 'cheerio:page', request.url, error, request.retryCount, 0);
+      },
     },
     makeConfig()
   );
 
-  await secondPass.run(urlsToVisit);
+  await runTracked(ctx, secondPass, urlsToVisit);
 
   // Fallback hit/miss metrics — only logged when fallbacks were actually used.
   if (queue.fallbackTeamLinks.length > 0) {
@@ -282,7 +358,38 @@ async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
   return pages;
 }
 
-async function crawlWithPlaywright(baseUrl: string): Promise<CrawledPage[]> {
+// ── Playwright page helpers ──────────────────────────────────────────────────
+
+/**
+ * `ignoreHTTPSErrors` is the important entry here.
+ *
+ * CheerioCrawler defaults to `ignoreSslErrors: true`, but crawlee only enables
+ * the browser equivalent behind a MITM proxy. Since the Playwright path runs
+ * ONLY when Cheerio returned almost no text, the sites that reach it are the
+ * JS-rendered long tail — exactly where an expired or self-signed certificate
+ * turned into an unexplained `net::ERR_CERT_*` failure.
+ */
+const PLAYWRIGHT_LAUNCH_OPTIONS = { headless: true, ignoreHTTPSErrors: true } as const;
+
+/**
+ * `document.body` is null for anything Chromium does not render into an HTML
+ * body — a PDF or XML content type, an empty 204, a URL that triggers a
+ * download. Reading `.innerText` off it threw inside the request handler,
+ * which crawlee counted as a failed request and retried. The guessed fallback
+ * paths (/services, /history, TEAM_PATHS) are precisely the URLs that land on
+ * a PDF, so this was a routine occurrence.
+ */
+async function pageInnerText(page: PlaywrightPage): Promise<string> {
+  return page
+    .evaluate(() => document.body?.innerText ?? document.documentElement?.innerText ?? '')
+    .catch(() => '');
+}
+
+async function pageHtml(page: PlaywrightPage): Promise<string> {
+  return page.content().catch(() => '');
+}
+
+async function crawlWithPlaywright(baseUrl: string, ctx: CrawlContext): Promise<CrawledPage[]> {
   const pages: CrawledPage[] = [];
   let homepageHtml = '';
 
@@ -290,11 +397,18 @@ async function crawlWithPlaywright(baseUrl: string): Promise<CrawledPage[]> {
     {
       maxRequestsPerCrawl: 1,
       requestHandlerTimeoutSecs: 30,
-      launchContext: { launchOptions: { headless: true } },
+      // Without this the BrowserCrawler default of 60s applies — twice the
+      // handler budget above, and enough on its own to blow CRAWL_TIMEOUT_MS.
+      navigationTimeoutSecs: 20,
+      maxRequestRetries: 1,
+      maxConcurrency: 3,
+      browserPoolOptions: { maxOpenPagesPerBrowser: 3 },
+      launchContext: { launchOptions: PLAYWRIGHT_LAUNCH_OPTIONS },
       async requestHandler({ page, request }) {
         await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-        const html = await page.content();
-        const text = await page.evaluate(() => document.body.innerText);
+        const html = await pageHtml(page);
+        const text = await pageInnerText(page);
+        if (!html && !text) return;
         homepageHtml = html;
         // Collect same-origin frame content — iframes on contact pages sometimes
         // contain the actual contact details rendered by a CMS widget.
@@ -324,14 +438,14 @@ async function crawlWithPlaywright(baseUrl: string): Promise<CrawledPage[]> {
           logoUrls,
         });
       },
-      failedRequestHandler({ request, log }) {
-        log.error(`Playwright failed: ${request.url}`);
+      failedRequestHandler({ request }, error) {
+        logFailure(ctx, 'playwright:first', request.url, error, request.retryCount, 1);
       },
     },
     makeConfig()
   );
 
-  await firstPass.run([baseUrl]);
+  await runTracked(ctx, firstPass, [baseUrl]);
   if (pages.length === 0 || !homepageHtml) return pages;
 
   const queue = buildUrlQueue(homepageHtml, baseUrl);
@@ -351,11 +465,15 @@ async function crawlWithPlaywright(baseUrl: string): Promise<CrawledPage[]> {
       maxRequestsPerCrawl: urlsToVisit.length,
       requestHandlerTimeoutSecs: 15,
       navigationTimeoutSecs: 15,
-      launchContext: { launchOptions: { headless: true } },
+      maxRequestRetries: 0,
+      maxConcurrency: 3,
+      browserPoolOptions: { maxOpenPagesPerBrowser: 3 },
+      launchContext: { launchOptions: PLAYWRIGHT_LAUNCH_OPTIONS },
       async requestHandler({ page, request }) {
         await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-        const text = await page.evaluate(() => document.body.innerText);
-        const html = await page.content();
+        const text = await pageInnerText(page);
+        const html = await pageHtml(page);
+        if (!html && !text) return;
         const origin = new URL(baseUrl).origin;
         const frameHtmlChunks: string[] = [];
         for (const frame of page.frames().slice(1)) {
@@ -407,12 +525,14 @@ async function crawlWithPlaywright(baseUrl: string): Promise<CrawledPage[]> {
           clickedContacts,
         });
       },
-      failedRequestHandler() { /* silent */ },
+      failedRequestHandler({ request }, error) {
+        logFailure(ctx, 'playwright:page', request.url, error, request.retryCount, 0);
+      },
     },
     makeConfig()
   );
 
-  await secondPass.run(urlsToVisit);
+  await runTracked(ctx, secondPass, urlsToVisit);
 
   if (queue.fallbackTeamLinks.length > 0) {
     const fallbackSet = new Set(queue.fallbackTeamLinks.map(normalizeUrl));
@@ -494,19 +614,56 @@ async function fetchForBotCheck(url: string): Promise<CrawledPage | null> {
 
 const CRAWL_TIMEOUT_MS = 120_000;
 
-export async function crawlCompany(baseUrl: string): Promise<CrawledPage[]> {
+export interface CrawlResult {
+  pages: CrawledPage[];
+  /**
+   * Why the crawl produced nothing. Undefined when pages were returned.
+   * The worker uses this to write an explanatory `crawlNote` and to skip
+   * pg-boss retries for causes that cannot change between attempts.
+   */
+  failure?: CrawlErrorInfo;
+}
+
+/**
+ * Crawls a company site, reporting *why* it failed when it produces nothing.
+ *
+ * Order matters: the DNS preflight comes first because discovery harvests
+ * domains from links on scraped pages, so dead hosts routinely reach the
+ * worker. Without it a non-existent domain cost roughly two minutes and a
+ * dozen Chromium launches — four crawler instances retrying, then pg-boss
+ * retrying the whole job — before anyone learned the host simply does not
+ * exist.
+ */
+export async function crawlCompanyDetailed(baseUrl: string): Promise<CrawlResult> {
+  const ctx = newContext();
+
+  let hostname: string;
+  try {
+    hostname = new URL(baseUrl).hostname;
+  } catch {
+    return { pages: [], failure: { code: 'UNKNOWN', retryable: false, message: `invalid URL: ${baseUrl}` } };
+  }
+
+  if (!(await resolvesInDns(hostname))) {
+    console.warn(`[crawl:fail] dns ${baseUrl} code=DNS_NOT_FOUND — host does not resolve`);
+    return {
+      pages: [],
+      failure: { code: 'DNS_NOT_FOUND', retryable: false, message: `getaddrinfo ENOTFOUND ${hostname}` },
+    };
+  }
+
   const crawl = async (): Promise<CrawledPage[]> => {
     // Pre-flight: capture bot-protection pages served on 4xx responses
     // (CheerioCrawler would silently drop the 403 body — this preserves it)
     const blockedPage = await fetchForBotCheck(baseUrl);
     if (blockedPage) return [blockedPage];
 
-    let pages = await crawlWithCheerio(baseUrl);
+    let pages = await crawlWithCheerio(baseUrl, ctx);
 
     const totalText = pages.reduce((acc, p) => acc + p.text.trim().length, 0);
     if (pages.length === 0 || totalText < 200) {
       console.log(`[crawl] Cheerio got little content for ${baseUrl}, falling back to Playwright`);
-      pages = await crawlWithPlaywright(baseUrl);
+      pages = await crawlWithPlaywright(baseUrl, ctx);
     }
 
     return pages;
@@ -517,13 +674,44 @@ export async function crawlCompany(baseUrl: string): Promise<CrawledPage[]> {
   const timeout = new Promise<CrawledPage[]>((resolve) => {
     timeoutId = setTimeout(() => {
       console.warn(`[crawl] timeout after ${CRAWL_TIMEOUT_MS / 1000}s for ${baseUrl}`);
+      ctx.firstFailure ??= {
+        code: 'TIMEOUT',
+        retryable: true,
+        message: `crawl exceeded ${CRAWL_TIMEOUT_MS}ms`,
+      };
       resolve([]);
     }, CRAWL_TIMEOUT_MS);
   });
 
+  // Losing the race abandons this promise but does NOT stop it — the swallow
+  // keeps an abandoned crawl from surfacing as an unhandled rejection once
+  // teardownAll closes the browser out from under it.
+  const running = crawl();
+  running.catch(() => { /* abandoned crawl — teardown below reclaims it */ });
+
   try {
-    return await Promise.race([crawl(), timeout]);
+    const pages = await Promise.race([running, timeout]);
+    return { pages, failure: pages.length === 0 ? ctx.firstFailure : undefined };
+  } catch (err) {
+    // A browser that cannot launch throws straight out of `crawler.run()` — it
+    // never reaches failedRequestHandler. Classifying it here is what lets the
+    // worker record "browser engine unavailable" instead of an opaque job
+    // failure retried three times against a Chromium that is not installed.
+    const info = classifyCrawlError(err);
+    console.error(`[crawl:fail] pipeline ${baseUrl} code=${info.code} — ${firstLine(info.message).slice(0, 300)}`);
+    // A pipeline-level throw outranks ctx.firstFailure: that earlier failure was
+    // recovered from by falling through to the next engine, this one ended the
+    // crawl. Fall back to the recorded one only when this error is unclassified.
+    return { pages: [], failure: info.code === 'UNKNOWN' ? ctx.firstFailure ?? info : info };
   } finally {
     clearTimeout(timeoutId);
+    // Reclaims any crawler still live — the timeout path, and the throw path
+    // where crawlee never reached its own cleanup.
+    await teardownAll(ctx);
   }
+}
+
+/** Back-compatible shape for callers that only need the pages. */
+export async function crawlCompany(baseUrl: string): Promise<CrawledPage[]> {
+  return (await crawlCompanyDetailed(baseUrl)).pages;
 }
