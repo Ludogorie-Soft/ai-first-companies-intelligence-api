@@ -4,7 +4,8 @@ const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 /**
  * Finds a recent COMPLETED batch with the same discoveryKey.
- * Returns null on cache miss (no match, too old, no candidates, or FAILED batch).
+ * Returns null on cache miss (no match, too old, no candidates, a FAILED batch,
+ * or a batch whose candidates predate the decision record).
  */
 export async function findCachedDiscovery(
   currentBatchId: string,
@@ -18,7 +19,17 @@ export async function findCachedDiscovery(
       discoveryKey,
       status:       'COMPLETED',
       updatedAt:    { gte: cutoff },
-      discoveryCandidates: { some: {} },
+      discoveryCandidates: {
+        some: {},                   // has candidates at all
+        // ...and every one of them carries a decision record. A batch written by
+        // an older build has no reason and no criteria on any row, and copying it
+        // forward replays that emptiness into every future repeat of the search
+        // for the whole TTL. `decidedAt` is written in the same statement as
+        // `decisionSignals`, so it is an exact marker for "produced by this
+        // pipeline" — and unlike bumping FILTER_VERSION, this keeps working if a
+        // stale build ever runs again, and does not discard the good batches.
+        none: { decidedAt: null },
+      },
     },
     orderBy: { updatedAt: 'desc' },
     select:  { id: true },
@@ -41,9 +52,14 @@ export async function copyCandidatesToBatch(
   if (candidates.length === 0) return 0;
 
   const rows = candidates.map(
-    ({ id: _id, batchId: _b, createdAt: _c, ...rest }) => ({
+    ({ id: _id, batchId: _b, createdAt: _c, decisionSignals, ...rest }) => ({
       ...rest,
       batchId: targetBatchId,
+      // Prisma's Json input type rejects a bare `null` (it wants DbNull/JsonNull),
+      // so a candidate with no signals is copied with the field omitted.
+      ...(decisionSignals == null
+        ? {}
+        : { decisionSignals: decisionSignals as unknown as object[] }),
     }),
   );
 

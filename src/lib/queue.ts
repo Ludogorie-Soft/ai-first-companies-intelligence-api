@@ -16,6 +16,13 @@ export interface CrawlCompanyPayload {
   templateId?: string;
   /** Preferred language for Email Subject / Outreach Message / Campaign Email. */
   emailLanguage?: EmailLanguagePreference;
+  /**
+   * The persona search this crawl came from. Set only for PERSONA_SEARCH batches;
+   * a CSV upload has no search criteria to verify against, so leaving these
+   * undefined is what makes post-crawl verification skip uploaded batches entirely.
+   */
+  persona?: string;
+  location?: string;
 }
 
 export interface DiscoverPersonaPayload {

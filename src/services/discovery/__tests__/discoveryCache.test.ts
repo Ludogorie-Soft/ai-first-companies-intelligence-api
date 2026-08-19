@@ -45,8 +45,35 @@ describe('findCachedDiscovery', () => {
     expect(call.where.id).toEqual({ not: CURRENT });
     expect(call.where.discoveryKey).toBe(KEY);
     expect(call.where.status).toBe('COMPLETED');
-    expect(call.where.discoveryCandidates).toEqual({ some: {} });
+    expect(call.where.discoveryCandidates).toEqual({ some: {}, none: { decidedAt: null } });
     expect(call.where.updatedAt.gte).toBeInstanceOf(Date);
+  });
+
+  // A batch written before the decision record has no reason and no criteria on
+  // any row. Serving it as cache copies that emptiness forward into every repeat
+  // of the search for the whole 30-day TTL — which is how three consecutive
+  // persona searches came back blank long after the pipeline itself was fixed.
+  test('requires every cached candidate to carry a decision record', async () => {
+    mockFindFirst.mockResolvedValue(null);
+    await findCachedDiscovery(CURRENT, KEY);
+
+    const { discoveryCandidates } = mockFindFirst.mock.calls[0][0].where;
+    // `some: {}` alone would match a batch full of undecided rows.
+    expect(discoveryCandidates.some).toEqual({});
+    expect(discoveryCandidates.none).toEqual({ decidedAt: null });
+  });
+
+  test('the guard is on decidedAt, not on the filter version', async () => {
+    // Bumping FILTER_VERSION cannot protect against this: the key is computed by
+    // the API while the rows are written by the worker, so a stale worker poisons
+    // the current version's key. Keying the guard on the data keeps working, and
+    // does not discard batches that were produced correctly.
+    mockFindFirst.mockResolvedValue(null);
+    await findCachedDiscovery(CURRENT, KEY);
+
+    const { where } = mockFindFirst.mock.calls[0][0];
+    expect(where.discoveryKey).toBe(KEY);
+    expect(where.discoveryCandidates.none).toEqual({ decidedAt: null });
   });
 
   test('returns null on cache miss', async () => {

@@ -14,8 +14,10 @@ import { validateEmails } from '../services/emailValidation';
 import { validateServices, selectServicesPages } from '../services/servicesValidation';
 import { runLoginFallbackEnrichment } from '../services/loginFallbackEnrichment';
 import { DiscoveryOrchestrator, SearchProviderError } from '../services/discovery/index';
-import { buildDiscoveryKey } from '../services/discovery/discoveryKey';
+import { buildDiscoveryKey, FILTER_VERSION } from '../services/discovery/discoveryKey';
+import { groqModel } from '../services/discovery';
 import { findCachedDiscovery, copyCandidatesToBatch } from '../services/discovery/discoveryCache';
+import { verifyAfterCrawl } from '../services/postCrawlVerification';
 import { checkFreshness } from '../lib/freshness';
 import { generatePersonalizedContent } from '../services/personalization';
 import { generateCampaignEmail } from '../services/campaignEmailGeneration';
@@ -462,6 +464,21 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
     console.log(`[worker] done ${domain} — score: ${upsertScore}`);
     await refreshBatchProgress(batchId, tenantId);
 
+    // 5b. Verify the crawled address against the search that found this company.
+    // Best-effort: a verification failure must never fail or retry the crawl.
+    try {
+      const verdict = await verifyAfterCrawl({
+        companyId, domain, batchId, tenantId,
+        persona:  job.data.persona,
+        location: job.data.location,
+      });
+      if (verdict.verified && verdict.demoted) {
+        console.log(`[worker] ${domain} moved to review — ${verdict.detail}`);
+      }
+    } catch (verifyErr) {
+      console.error(`[worker] post-crawl verification failed for ${domain}:`, verifyErr);
+    }
+
     // 6. Enqueue personalization — best-effort; failure must not cause a crawl retry or FAILED status
     try {
       const pQueue = await getQueue();
@@ -528,6 +545,8 @@ async function enqueueCrawlsFromEntries(
   templateId: string | undefined,
   crawlQueue: PgBoss,
   emailLanguage?: EmailLanguagePreference,
+  /** Carried into each crawl job so the result can be verified against the search. */
+  searchContext?: { persona: string; location: string },
 ): Promise<void> {
   const crawlable = entries
     .filter(e => !e.domain.endsWith('.local') && !isNonCrawlablePlatform(e.domain))
@@ -595,6 +614,8 @@ async function enqueueCrawlsFromEntries(
         tenantId,
         templateId,
         emailLanguage,
+        persona:  searchContext?.persona,
+        location: searchContext?.location,
       },
       crawlQueue,
     );
@@ -643,9 +664,12 @@ async function processDiscoverJob(
           select: { domain: true, orgName: true, title: true },
         });
 
+        // Only KEPT rows are enqueued — REVIEW ones stay waiting for the user,
+        // exactly as they would on a fresh run.
         await enqueueCrawlsFromEntries(
           keptRows.map(r => ({ domain: r.domain, name: r.orgName ?? r.title })),
           batchId, tenantId, limit, forceRecrawl ?? false, templateId, crawlQueue, emailLanguagePref,
+          { persona, location },
         );
         return;
       }
@@ -655,14 +679,14 @@ async function processDiscoverJob(
 
     // ── Run the full hybrid discovery pipeline ────────────────────────────────
     const orchestrator = new DiscoveryOrchestrator();
-    const { accepted, rejected, allCandidates } = await orchestrator.discover({
+    const { accepted, review, rejected, allCandidates } = await orchestrator.discover({
       persona,
       location,
       keywords,
       maxResults,
     });
 
-    // ── Persist all candidates to DB (accepted + rejected) for UI transparency ─
+    // ── Persist every candidate with its decision, for UI transparency ────────
     if (allCandidates.length > 0) {
       // Build a synthetic domain for extracted orgs that have no known website.
       // These are stored in DiscoveryCandidate for UI/export but never enqueued for crawling.
@@ -671,20 +695,30 @@ async function processDiscoverJob(
           c.domain ??
           `extracted-${Buffer.from((c.name ?? c.sourceUrl).slice(0, 40)).toString('hex').slice(0, 16)}.local`;
 
-        const isNcp      = !!c.domain && isNonCrawlablePlatform(c.domain);
-        const isAccepted = accepted.includes(c);
-        const wasBlocked  = c.pageType === 'IRRELEVANT' && !c.extractedFromUrl;
+        const isNcp     = !!c.domain && isNonCrawlablePlatform(c.domain);
+        const wasBlocked = c.pageType === 'IRRELEVANT' && !c.extractedFromUrl;
+        const decision  = c.decision;
 
         if (isNcp) {
           console.log(`[platform] detected ${domain}`);
           platformMetrics.nonCrawlableRejected++;
         }
 
-        const status: 'KEPT' | 'FILTERED' | 'BLOCKED' = (isNcp || wasBlocked)
-          ? (wasBlocked ? 'BLOCKED' : 'FILTERED')
-          : isAccepted
-            ? 'KEPT'
-            : 'FILTERED';
+        // A platform we cannot crawl and a blocklisted domain are terminal states
+        // that outrank the verdict — there is nothing for a human to review.
+        const status: 'KEPT' | 'REVIEW' | 'FILTERED' | 'BLOCKED' =
+            wasBlocked                     ? 'BLOCKED'
+          : isNcp                          ? 'FILTERED'
+          : decision?.verdict === 'ACCEPT' ? 'KEPT'
+          : decision?.verdict === 'REVIEW' ? 'REVIEW'
+          :                                  'FILTERED';
+
+        // The reason is stored for ALL verdicts, accepts included, so the UI can
+        // answer "why was this kept?" as well as "why was this dropped?".
+        const reason =
+            isNcp      ? 'NON_CRAWLABLE_PLATFORM'
+          : wasBlocked ? 'BLOCKLISTED_AGGREGATOR'
+          :              decision?.primaryReason ?? null;
 
         return {
           batchId,
@@ -701,7 +735,9 @@ async function processDiscoverJob(
           extractedEmail:   c.email ?? null,
           extractedPhone:   c.phone ?? null,
           extractedAddress: c.address ?? null,
-          rejectedReason:   isNcp ? 'NON_CRAWLABLE_PLATFORM' : isAccepted ? null : (c.rejectedReason ?? null),
+          rejectedReason:   reason,
+          decisionSignals:  (decision?.signals ?? []) as unknown as object[],
+          decidedAt:        new Date(),
         };
       });
 
@@ -713,12 +749,15 @@ async function processDiscoverJob(
       .map(c => ({ domain: c.domain!, name: c.name ?? c.title ?? null }));
 
     console.log(
-      `[worker/discover] accepted=${accepted.length} rejected=${rejected.length} ` +
-      `total=${allCandidates.length}`,
+      `[worker/discover] accepted=${accepted.length} review=${review.length} ` +
+      `rejected=${rejected.length} total=${allCandidates.length}`,
     );
 
+    // Only accepted candidates are crawled. Review ones wait in the "For review"
+    // tab until the user includes them — that is the point of the tier.
     await enqueueCrawlsFromEntries(
       acceptedEntries, batchId, tenantId, limit, forceRecrawl ?? false, templateId, crawlQueue, emailLanguagePref,
+      { persona, location },
     );
 
   } catch (err) {
@@ -846,6 +885,15 @@ export async function startWorker(): Promise<void> {
     }
   );
 
+  // Identity banner. pg-boss hands each job to whichever consumer polls first, so a
+  // forgotten worker from an older build will happily process jobs alongside this
+  // one and its rows come out looking like a filtering regression. Announcing pid
+  // and filter version makes a second, stale consumer obvious in the log instead of
+  // something you have to infer afterwards from confidence values and leftover HTML.
+  console.log(
+    `[worker] pid=${process.pid} filter=${FILTER_VERSION} model=${groqModel()} ` +
+    `concurrency=${CONCURRENCY} node=${process.version}`,
+  );
   console.log(`[worker] listening on queues "${QUEUES.CRAWL_COMPANY}", "${QUEUES.DISCOVER_PERSONA}", "${QUEUES.PERSONALIZE_COMPANY}" (concurrency: ${CONCURRENCY})`);
 
   // Graceful shutdown — handles both standalone and embedded modes

@@ -9,6 +9,7 @@
     "build": "npm run build:swagger && tsc",
     "build:swagger": "ts-node --transpile-only scripts/generate-swagger.ts",
     "start": "node dist/api/server.js",
+    "prestart:worker": "npm run build",
     "start:worker": "node dist/worker/index.js",
     "db:migrate": "prisma migrate dev",
     "db:generate": "prisma generate",

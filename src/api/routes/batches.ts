@@ -21,6 +21,32 @@ import { emailLanguageFromSearchQuery } from '../../lib/emailLanguage';
 
 const router = Router();
 
+/**
+ * The persona/location a batch was searched with, when it was a persona search.
+ * Returns {} for CSV uploads — which is what keeps post-crawl verification from
+ * running on batches that have no search criteria to verify against.
+ */
+function searchContext(searchQuery: unknown): { persona?: string; location?: string } {
+  const sq = (searchQuery ?? {}) as Record<string, unknown>;
+  const persona  = typeof sq.persona  === 'string' ? sq.persona  : undefined;
+  const location = typeof sq.location === 'string' ? sq.location : undefined;
+  return persona && location ? { persona, location } : {};
+}
+
+/**
+ * Appends the user's own decision to a candidate's signal list, preserving the
+ * automated ones. A manual override is part of the audit trail, not a reset of it.
+ */
+function appendUserSignal(
+  existing: unknown,
+  criterion: string,
+  effect: 'ACCEPT' | 'REJECT',
+  detail: string,
+): object[] {
+  const prior = Array.isArray(existing) ? existing as object[] : [];
+  return [...prior, { criterion, effect, stage: 'qualifier', detail }];
+}
+
 // Cap below Vercel Hobby ~4.5 MB request body limit.
 const MAX_FILE_SIZE = 4 * 1024 * 1024; // 4 MB
 const upload = multer({ dest: '/tmp/uploads/', limits: { fileSize: MAX_FILE_SIZE } });
@@ -626,10 +652,10 @@ router.patch('/:id/candidates/:domain', requireAuth, async (req: Request, res: R
   const batchId = String(req.params.id);
   const domain = String(req.params.domain);
   const tenantId = req.user.tenantId;
-  const { action } = req.body as { action: 'exclude' | 'include' };
+  const { action } = req.body as { action: 'exclude' | 'include' | 'reject' };
 
-  if (!['exclude', 'include'].includes(action)) {
-    res.status(400).json({ error: 'action must be "exclude" or "include"' });
+  if (!['exclude', 'include', 'reject'].includes(action)) {
+    res.status(400).json({ error: 'action must be "exclude", "include" or "reject"' });
     return;
   }
 
@@ -645,6 +671,26 @@ router.patch('/:id/candidates/:domain', requireAuth, async (req: Request, res: R
     });
     if (!candidate) {
       res.status(404).json({ error: 'Candidate not found' });
+      return;
+    }
+
+    if (action === 'reject') {
+      // Used by the "For review" tab: the user has looked at an uncertain
+      // candidate and decided against it. Distinct from 'exclude', which pulls a
+      // company that was already crawled out of the results.
+      await prisma.discoveryCandidate.update({
+        where: { batchId_domain: { batchId, domain } },
+        data: {
+          status:          'FILTERED',
+          rejectedReason:  'USER_REJECTED',
+          decidedAt:       new Date(),
+          decisionSignals: appendUserSignal(
+            candidate.decisionSignals,
+            'USER_REJECTED', 'REJECT', 'отхвърлен ръчно от прегледа',
+          ),
+        },
+      });
+      res.json({ ok: true });
       return;
     }
 
@@ -688,7 +734,7 @@ router.patch('/:id/candidates/:domain', requireAuth, async (req: Request, res: R
         await refreshBatchProgress(batchId, tenantId);
         res.json({ ok: true });
       } else {
-        // FILTERED or BLOCKED → KEPT: upsert company + tenantCompany, enqueue crawl
+        // REVIEW, FILTERED or BLOCKED → KEPT: upsert company + tenantCompany, enqueue crawl
         const baseUrl = `https://${domain}`;
         const company = await prisma.company.upsert({
           where: { domain },
@@ -701,7 +747,15 @@ router.patch('/:id/candidates/:domain', requireAuth, async (req: Request, res: R
         });
         await prisma.discoveryCandidate.update({
           where: { batchId_domain: { batchId, domain } },
-          data: { status: 'KEPT' },
+          data: {
+            status:          'KEPT',
+            rejectedReason:  'USER_INCLUDED',
+            decidedAt:       new Date(),
+            decisionSignals: appendUserSignal(
+              candidate.decisionSignals,
+              'USER_INCLUDED', 'ACCEPT', 'включен ръчно от потребителя',
+            ),
+          },
         });
 
         if (isNonCrawlablePlatform(domain)) {
@@ -738,6 +792,9 @@ router.patch('/:id/candidates/:domain', requireAuth, async (req: Request, res: R
             tenantId,
             templateId: batch.templateId ?? undefined,
             emailLanguage: emailLanguageFromSearchQuery(batch.searchQuery),
+            // Carried so a manually included candidate gets the same post-crawl
+            // address verification as an automatically accepted one.
+            ...searchContext(batch.searchQuery),
           },
           queue,
         );
