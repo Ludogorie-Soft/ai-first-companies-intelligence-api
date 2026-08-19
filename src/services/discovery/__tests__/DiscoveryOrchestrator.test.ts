@@ -199,7 +199,58 @@ describe('DiscoveryOrchestrator — scenario E: duplicate candidates', () => {
       c.name?.toLowerCase().includes('слънце') || c.email === 'a@dg.bg',
     );
     expect(slanceCandidates).toHaveLength(1);
-    expect(slanceCandidates[0].confidence).toBe(80);
+
+    // The higher-confidence duplicate is the one kept. `confidence` now carries
+    // the final, post-decision score, so assert the survivor's identity and that
+    // qualification did not push it below where it started.
+    expect(slanceCandidates[0].domain).toBe('dg-slance.bg');
+    expect(slanceCandidates[0].confidence).toBeGreaterThanOrEqual(80);
+  });
+});
+
+describe('DiscoveryOrchestrator — the review tier', () => {
+  it('separates uncertain candidates from accepted and rejected ones', async () => {
+    const source = makeSource('SearchSource', [
+      // Confident: a school name with its own domain.
+      makeResult({ name: 'ДГ Слънце', domain: 'dg-slance.bg', confidence: 75 }),
+      // Uncertain: the LLM filter never returned a verdict for this one.
+      makeResult({
+        name: 'ДГ Пролет', domain: 'dg-prolet.bg', confidence: 45,
+        signals: [{ criterion: 'LLM_UNJUDGED', effect: 'REVIEW', stage: 'llm' }],
+      }),
+      // Rejected outright.
+      makeResult({
+        name: 'Каталог на детски градини', domain: 'katalog.bg',
+        pageType: 'DIRECTORY_OR_PORTAL', confidence: 20,
+      }),
+    ]);
+
+    const orchestrator = new DiscoveryOrchestrator([source]);
+    const { accepted, review, rejected, allCandidates } = await orchestrator.discover(input);
+
+    expect(accepted.map(c => c.domain)).toContain('dg-slance.bg');
+    expect(review.map(c => c.domain)).toContain('dg-prolet.bg');
+    expect(rejected.map(c => c.domain)).toContain('katalog.bg');
+
+    // Every candidate carries a decision, and the three buckets partition the set.
+    expect(allCandidates.every(c => !!c.decision)).toBe(true);
+    expect(accepted.length + review.length + rejected.length).toBe(allCandidates.length);
+  });
+
+  it('writes the decision onto the persisted candidate objects, not onto copies', async () => {
+    // The worker persists `allCandidates`. A decision assigned to a copy never
+    // reached the database — every qualifier-stage reason was stored as NULL.
+    const source = makeSource('SearchSource', [
+      makeResult({ domain: 'katalog.bg', pageType: 'DIRECTORY_OR_PORTAL', confidence: 20 }),
+    ]);
+
+    const orchestrator = new DiscoveryOrchestrator([source]);
+    const { rejected, allCandidates } = await orchestrator.discover(input);
+
+    const persisted = allCandidates.find(c => c.domain === 'katalog.bg');
+    expect(persisted).toBe(rejected[0]);                      // same object reference
+    expect(persisted?.decision?.primaryReason).toBeTruthy();  // reason survives to the DB
+    expect(persisted?.decision?.signals.length).toBeGreaterThan(0);
   });
 });
 

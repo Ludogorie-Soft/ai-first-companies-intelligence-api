@@ -1,20 +1,45 @@
-import { PageClassifier } from './PageClassifier';
+import { PageClassifier, DEFAULT_MIN_SCORE, LLM_APPROVED_MIN_SCORE } from './PageClassifier';
 import { OrganizationExtractor } from './OrganizationExtractor';
 import { CandidateNormalizer } from './CandidateNormalizer';
 import { CandidateQualifier } from './CandidateQualifier';
 import { SearchDiscoverySource } from './sources/SearchDiscoverySource';
 import { EducationRegistrySource } from './sources/EducationRegistrySource';
+import { signal } from './types';
 import type {
   DiscoverySource,
   DiscoverySourceResult,
   OrchestrationResult,
   PageType,
   PersonaSearchInput,
+  ReasonCode,
+  Verdict,
 } from './types';
 import { SearchProviderError } from '../discovery';
 
-export type { PersonaSearchInput, DiscoverySourceResult, OrchestrationResult } from './types';
+export type {
+  PersonaSearchInput,
+  DiscoverySourceResult,
+  OrchestrationResult,
+  FilterDecision,
+  DecisionSignal,
+  ReasonCode,
+  Verdict,
+} from './types';
 export { SearchProviderError };
+
+/**
+ * How a page type argues, and under which reason code, when the classifier
+ * reports it. Types absent from this map carry no weight on their own.
+ */
+const PAGE_TYPE_SIGNAL: Partial<Record<PageType, { code: ReasonCode; effect: Verdict }>> = {
+  MUNICIPALITY_PAGE:   { code: 'MUNICIPALITY_PAGE',           effect: 'REJECT' },
+  DIRECTORY_OR_PORTAL: { code: 'DIRECTORY_OR_PORTAL',         effect: 'REJECT' },
+  NEWS_ARTICLE:        { code: 'NEWS_ARTICLE',                effect: 'REJECT' },
+  OFFICIAL_REGISTRY:   { code: 'OFFICIAL_REGISTRY',           effect: 'REJECT' },
+  SOCIAL_PAGE:         { code: 'SOCIAL_PLATFORM',             effect: 'REJECT' },
+  IRRELEVANT:          { code: 'NOT_TARGET_ORGANIZATION',     effect: 'REJECT' },
+  TARGET_ORGANIZATION: { code: 'MATCHES_PERSONA_AND_LOCATION', effect: 'ACCEPT' },
+};
 
 const PAGE_FETCH_TIMEOUT_MS = 10_000;
 // Max number of suspected municipality/directory pages to fetch HTML for per run.
@@ -105,8 +130,12 @@ export class DiscoveryOrchestrator {
     const metaClassified = rawCandidates.map(c => {
       if (c.pageType !== 'UNKNOWN' && c.pageType !== 'IRRELEVANT') return c;
 
-      const pageType = this.classifier.classifyFromMeta(
-        c.sourceUrl, c.title ?? '', c.snippet ?? '', input,
+      // The classifier reads the same title and snippet the LLM already judged, so
+      // an LLM-approved candidate needs two independent signals (or a decisive
+      // hostname signal) before it can be reclassified — not one stray keyword.
+      const minScore = c.llmApproved ? LLM_APPROVED_MIN_SCORE : DEFAULT_MIN_SCORE;
+      const { type: pageType, score, evidence } = this.classifier.classifyFromMeta(
+        c.sourceUrl, c.title ?? '', c.snippet ?? '', input, minScore,
       );
 
       if (c.pageType === 'IRRELEVANT') {
@@ -119,7 +148,20 @@ export class DiscoveryOrchestrator {
 
       // UNKNOWN candidate
       if (pageType !== 'UNKNOWN') {
-        console.log(`[discovery] classified url=${c.sourceUrl} type=${pageType} (meta)`);
+        console.log(
+          `[discovery] classified url=${c.sourceUrl} type=${pageType} score=${score} ` +
+          `(meta, bar=${minScore}${c.llmApproved ? ', overrode LLM approval' : ''})`,
+        );
+        const spec = PAGE_TYPE_SIGNAL[pageType];
+        const signals = [...(c.signals ?? [])];
+        if (spec) {
+          // Top three evidence lines: enough to explain the call without turning
+          // the expanded criteria list into a wall of keyword hits.
+          for (const why of evidence.slice(0, 3)) {
+            signals.push(signal(spec.code, spec.effect, 'classifier', why));
+          }
+        }
+        return { ...c, pageType, signals };
       }
       return { ...c, pageType };
     });
@@ -147,9 +189,12 @@ export class DiscoveryOrchestrator {
         const html = await fetchPageHtml(candidate.sourceUrl);
         if (!html) return;
 
-        const contentType = this.classifier.classifyFromContent(html, candidate.sourceUrl, input);
+        const { type: contentType, score } =
+          this.classifier.classifyFromContent(html, candidate.sourceUrl, input);
         confirmedPageTypes.set(candidate.sourceUrl, contentType);
-        console.log(`[discovery] classified url=${candidate.sourceUrl} type=${contentType} (content)`);
+        console.log(
+          `[discovery] classified url=${candidate.sourceUrl} type=${contentType} score=${score} (content)`,
+        );
 
         if (LIST_PAGE_TYPES.includes(contentType)) {
           console.log(`[discovery] rejected ${candidate.sourceUrl} as lead — is a ${contentType}`);
@@ -186,31 +231,45 @@ export class DiscoveryOrchestrator {
 
     // ── Step 6: Qualify ───────────────────────────────────────────────────────
     const accepted: DiscoverySourceResult[] = [];
+    const review:   DiscoverySourceResult[] = [];
     const rejected: DiscoverySourceResult[] = [];
 
     for (const candidate of normalized) {
-      const { accepted: ok, reason } = this.qualifier.qualify(candidate, input);
-      if (ok) {
+      // The decision is assigned onto the candidate itself, not onto a copy. The
+      // worker persists `normalized` — these very objects — so a decision written
+      // to a copy never reached the database: every qualifier-stage reason was
+      // stored as NULL, which is what made the bad list impossible to diagnose.
+      const decision = this.qualifier.decide(candidate, input);
+      candidate.decision   = decision;
+      candidate.confidence = decision.confidence;
+
+      const label = candidate.name ?? candidate.domain ?? candidate.sourceUrl;
+
+      if (decision.verdict === 'ACCEPT') {
         accepted.push(candidate);
-        if (candidate.domain) {
-          console.log(
-            `[discovery] accepted candidate name="${candidate.name ?? candidate.domain}" ` +
-            `confidence=${candidate.confidence} domain=${candidate.domain}`,
-          );
-        }
-      } else {
-        rejected.push({ ...candidate, rejectedReason: reason });
         console.log(
-          `[discovery] rejected candidate url=${candidate.sourceUrl} reason=${reason}`,
+          `[discovery] accepted candidate name="${label}" ` +
+          `confidence=${decision.confidence} reason=${decision.primaryReason}`,
+        );
+      } else if (decision.verdict === 'REVIEW') {
+        review.push(candidate);
+        console.log(
+          `[discovery] review candidate name="${label}" ` +
+          `confidence=${decision.confidence} reason=${decision.primaryReason}`,
+        );
+      } else {
+        rejected.push(candidate);
+        console.log(
+          `[discovery] rejected candidate url=${candidate.sourceUrl} reason=${decision.primaryReason}`,
         );
       }
     }
 
     console.log(
-      `[discovery] result: ${accepted.length} accepted, ${rejected.length} rejected ` +
-      `(${extractedOrgs.length} extracted from list pages)`,
+      `[discovery] result: ${accepted.length} accepted, ${review.length} for review, ` +
+      `${rejected.length} rejected (${extractedOrgs.length} extracted from list pages)`,
     );
 
-    return { accepted, rejected, allCandidates: normalized };
+    return { accepted, review, rejected, allCandidates: normalized };
   }
 }

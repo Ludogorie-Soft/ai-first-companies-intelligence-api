@@ -211,7 +211,13 @@ model DiscoveryCandidate {
   extractedEmail   String?   // pre-crawl email discovered during page extraction
   extractedPhone   String?   // pre-crawl phone discovered during page extraction
   extractedAddress String?   // pre-crawl address discovered during page extraction
-  rejectedReason   String?   // reason for FILTERED status (was only in-memory before)
+
+  // Decision record. `rejectedReason` keeps its historical column name but now holds
+  // a ReasonCode for EVERY verdict, accepts included — the UI shows a reason for both
+  // directions, so "why was this kept?" is as answerable as "why was this dropped?".
+  rejectedReason   String?   // ReasonCode, e.g. MATCHES_PERSONA_AND_LOCATION | LOCATION_CONFLICT
+  decisionSignals  Json?     // DecisionSignal[] — every criterion that fired, with its evidence
+  decidedAt        DateTime?
 
   batch CrawlBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
 
@@ -220,6 +226,7 @@ model DiscoveryCandidate {
 
 enum CandidateStatus {
   KEPT
+  REVIEW    // uncertain — surfaced in the "For review" tab, never crawled automatically
   FILTERED
   BLOCKED
   EXCLUDED

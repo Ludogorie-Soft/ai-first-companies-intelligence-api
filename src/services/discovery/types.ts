@@ -8,6 +8,90 @@ export type PageType =
   | 'IRRELEVANT'
   | 'UNKNOWN';
 
+// ── Decision record ───────────────────────────────────────────────────────────
+// Every filtering stage appends a DecisionSignal instead of returning a bare
+// string; CandidateQualifier folds the accumulated signals into one FilterDecision.
+// This is what makes a verdict explainable in the UI — and it is why accepts now
+// carry a reason too, not only rejects.
+
+export type Verdict = 'ACCEPT' | 'REVIEW' | 'REJECT';
+
+/**
+ * Stable machine codes. The frontend maps each to a translated label, so these
+ * strings are part of the API contract — rename one and the UI silently falls
+ * back to the raw code.
+ */
+export type ReasonCode =
+  // ── Reject ────────────────────────────────────────────────────────────────
+  | 'BLOCKLISTED_AGGREGATOR'
+  | 'MUNICIPALITY_PAGE'
+  | 'DIRECTORY_OR_PORTAL'
+  | 'NEWS_ARTICLE'
+  | 'SOCIAL_PLATFORM'
+  | 'OFFICIAL_REGISTRY'
+  | 'LOCATION_CONFLICT_VERIFIED'
+  | 'NOT_TARGET_ORGANIZATION'
+  | 'BELOW_CONFIDENCE_FLOOR'
+  | 'NO_CONTACT_SIGNAL'
+  | 'SAME_DOMAIN_AS_SOURCE'
+  | 'NON_CRAWLABLE_PLATFORM'
+  | 'USER_REJECTED'
+  // ── Review (uncertain — needs a human) ────────────────────────────────────
+  /** The LLM read the result and explicitly could not tell. Distinct from
+   *  LLM_UNJUDGED (never answered) and FILTER_DEGRADED (the call failed). */
+  | 'LLM_UNCERTAIN'
+  | 'LLM_UNJUDGED'
+  | 'FILTER_DEGRADED'
+  | 'LOCATION_CONFLICT'
+  | 'LOCATION_UNKNOWN'
+  | 'CONFLICTING_SIGNALS'
+  | 'BORDERLINE_CONFIDENCE'
+  // ── Accept ────────────────────────────────────────────────────────────────
+  | 'MATCHES_PERSONA_AND_LOCATION'
+  | 'EXTRACTED_FROM_LIST'
+  | 'USER_INCLUDED';
+
+/** Which part of the pipeline produced a signal. Shown as a column in the UI. */
+export type DecisionStage =
+  | 'search'
+  | 'blocklist'
+  | 'llm'
+  | 'classifier'
+  | 'location'
+  | 'qualifier'
+  | 'post_crawl';
+
+/** One criterion that fired, with the evidence behind it. */
+export interface DecisionSignal {
+  criterion: ReasonCode;
+  /** What this single signal argues for, independently of the final verdict. */
+  effect: Verdict;
+  stage: DecisionStage;
+  /** Human-readable evidence, e.g. `адрес „гр. Варна“ ≠ търсено „Мездра“`. */
+  detail?: string;
+  /** Contribution to the confidence score, for signals that carry weight. */
+  weight?: number;
+}
+
+export interface FilterDecision {
+  verdict: Verdict;
+  /** The signal that decided the verdict — what the UI shows in the Reason column. */
+  primaryReason: ReasonCode;
+  confidence: number;
+  /** Every criterion that fired, in evaluation order. */
+  signals: DecisionSignal[];
+}
+
+export function signal(
+  criterion: ReasonCode,
+  effect: Verdict,
+  stage: DecisionStage,
+  detail?: string,
+  weight?: number,
+): DecisionSignal {
+  return { criterion, effect, stage, detail, weight };
+}
+
 export interface PersonaSearchInput {
   persona: string;
   location: string;
@@ -45,8 +129,16 @@ export interface DiscoverySourceResult {
   title?: string;
   /** Snippet / short description from the search result. */
   snippet?: string;
-  /** Reason this candidate was rejected (populated by CandidateQualifier). */
-  rejectedReason?: string;
+  /**
+   * True when the LLM filter explicitly kept this candidate. Downstream heuristics
+   * read the same title+snippet the LLM already judged, so they need a higher bar
+   * before overturning it — see PageClassifier's minScore.
+   */
+  llmApproved?: boolean;
+  /** Signals gathered before qualification (blocklist, LLM, location). */
+  signals?: DecisionSignal[];
+  /** Final decision, set by CandidateQualifier. */
+  decision?: FilterDecision;
 }
 
 /** A pluggable source that produces discovery candidates. */
@@ -59,6 +151,8 @@ export interface DiscoverySource {
 export interface OrchestrationResult {
   /** Candidates that passed qualification — ready to upsert as Companies and enqueue for crawling. */
   accepted: DiscoverySourceResult[];
+  /** Candidates the pipeline is not confident about — surfaced in the "For review" tab, never crawled automatically. */
+  review: DiscoverySourceResult[];
   /** Candidates that were rejected with a reason (municipality pages, news, low confidence, etc.). */
   rejected: DiscoverySourceResult[];
   /** All candidates including rejected — persisted to DB for UI transparency. */

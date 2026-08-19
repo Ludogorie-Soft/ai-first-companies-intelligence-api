@@ -1,14 +1,30 @@
-import { buildDiscoveryKey } from '../discoveryKey';
+import { buildDiscoveryKey, FILTER_VERSION } from '../discoveryKey';
 
 describe('buildDiscoveryKey', () => {
+  // ── Filter version ──────────────────────────────────────────────────────────
+  // A cache hit copies candidate rows verbatim and enqueues the KEPT ones without
+  // re-qualifying, so a key that ignored the filter version would replay stale
+  // verdicts for the full 30-day window after any change to the filtering rules.
+
+  test('the key is namespaced by the filter version', () => {
+    expect(buildDiscoveryKey('детски градини', 'Враца')).toMatch(
+      new RegExp(`^${FILTER_VERSION}\\|`),
+    );
+  });
+
+  test('a key stored under a previous filter version cannot match', () => {
+    const legacyKey = 'детски градини|враца|';
+    expect(buildDiscoveryKey('детски градини', 'Враца')).not.toBe(legacyKey);
+  });
+
   // ── Basic shape ─────────────────────────────────────────────────────────────
 
   test('produces pipe-separated key', () => {
-    expect(buildDiscoveryKey('детски градини', 'Враца', '')).toBe('детски градини|враца|');
+    expect(buildDiscoveryKey('детски градини', 'Враца', '')).toBe(`${FILTER_VERSION}|детски градини|враца|`);
   });
 
   test('empty keywords produces trailing empty segment', () => {
-    expect(buildDiscoveryKey('детски градини', 'Враца')).toBe('детски градини|враца|');
+    expect(buildDiscoveryKey('детски градини', 'Враца')).toBe(`${FILTER_VERSION}|детски градини|враца|`);
   });
 
   // ── Case insensitivity ───────────────────────────────────────────────────────
@@ -27,12 +43,12 @@ describe('buildDiscoveryKey', () => {
 
   test('leading/trailing spaces are stripped', () => {
     expect(buildDiscoveryKey('  детски градини  ', '  Враца  '))
-      .toBe('детски градини|враца|');
+      .toBe(`${FILTER_VERSION}|детски градини|враца|`);
   });
 
   test('multiple internal spaces are collapsed', () => {
     expect(buildDiscoveryKey('детски  градини', 'Враца'))
-      .toBe('детски градини|враца|');
+      .toBe(`${FILTER_VERSION}|детски градини|враца|`);
   });
 
   // ── Keyword normalization ────────────────────────────────────────────────────

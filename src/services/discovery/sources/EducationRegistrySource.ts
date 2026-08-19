@@ -72,7 +72,7 @@ export class EducationRegistrySource implements DiscoverySource {
 
       for (const sr of searchResults.slice(0, 3)) {
         // Quick meta classification
-        const metaType = this.classifier.classifyFromMeta(sr.url, sr.title ?? '', '', input);
+        const { type: metaType } = this.classifier.classifyFromMeta(sr.url, sr.title ?? '', '', input);
 
         // We're specifically looking for registry / municipality pages here
         if (
@@ -86,7 +86,7 @@ export class EducationRegistrySource implements DiscoverySource {
         const html = await fetchHtml(sr.url);
         if (!html) continue;
 
-        const contentType = this.classifier.classifyFromContent(html, sr.url, input);
+        const { type: contentType } = this.classifier.classifyFromContent(html, sr.url, input);
         if (
           contentType === 'MUNICIPALITY_PAGE' ||
           contentType === 'OFFICIAL_REGISTRY' ||

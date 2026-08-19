@@ -19,6 +19,23 @@ describe('isEducationPersona', () => {
   test('detects "гимназии"',       () => expect(isEducationPersona('гимназии')).toBe(true));
   test('does not flag "ресторанти"', () => expect(isEducationPersona('ресторанти')).toBe(false));
   test('does not flag "хотели"',   () => expect(isEducationPersona('хотели')).toBe(false));
+
+  // The abbreviations are matched as whole tokens. Matched as substrings, "су"
+  // and "оу" swallow ordinary words — every sushi and supermarket search was
+  // routed through the education gate, which then rejected real businesses.
+  test('does not flag "суши ресторанти" (contains "су")', () =>
+    expect(isEducationPersona('суши ресторанти')).toBe(false));
+  test('does not flag "супермаркети" (contains "су")', () =>
+    expect(isEducationPersona('супермаркети')).toBe(false));
+  test('does not flag "оутлет магазини" (contains "оу")', () =>
+    expect(isEducationPersona('оутлет магазини')).toBe(false));
+  test('does not flag "пгради" — no bare abbreviation token', () =>
+    expect(isEducationPersona('пградиевци')).toBe(false));
+
+  test('still detects a genuine abbreviation used as a word', () => {
+    expect(isEducationPersona('ДГ')).toBe(true);
+    expect(isEducationPersona('СУ и ОУ')).toBe(true);
+  });
 });
 
 // ── classifyEducationCandidate ────────────────────────────────────────────────
@@ -41,6 +58,53 @@ describe('classifyEducationCandidate — positive cases', () => {
     const c = makeCandidate({ name: 'ДГ Слънце', domain: 'dg-slance.bg' });
     const r = classifyEducationCandidate(c);
     expect(r.accepted).toBe(true);
+  });
+
+  // Bulgarian schools are written with the name in quotes as often as with a
+  // space. Requiring whitespace after the prefix made the strongest positive
+  // signal miss exactly those names.
+  test('a quoted school name is accepted — ОУ„Христо Ботев“', () => {
+    const c = makeCandidate({ name: 'ОУ„Христо Ботев“', domain: 'ou-botev.bg' });
+    expect(classifyEducationCandidate(c).accepted).toBe(true);
+  });
+
+  test('a quoted kindergarten name is accepted — ДГ"Слънце"', () => {
+    const c = makeCandidate({ name: 'ДГ"Слънце"', domain: 'dg-slance.bg' });
+    expect(classifyEducationCandidate(c).accepted).toBe(true);
+  });
+
+  // A school that mentions its own municipality is still a school. The hard
+  // rejects below exist to catch municipal portals, not to punish a kindergarten
+  // for naming the town it is in.
+  test('a school name overrides an incidental "община" mention', () => {
+    const c = makeCandidate({
+      name: 'ДГ „Слънце“ – Община Мездра',
+      domain: 'dg-slance.bg',
+    });
+    expect(classifyEducationCandidate(c).accepted).toBe(true);
+  });
+
+  test('a school name overrides an incidental "новини" mention', () => {
+    const c = makeCandidate({ name: 'ОУ Христо Ботев – Новини', domain: 'ou-botev.bg' });
+    expect(classifyEducationCandidate(c).accepted).toBe(true);
+  });
+
+  test('but a bare municipality page is still rejected', () => {
+    const c = makeCandidate({ name: 'Община Мездра', domain: 'mezdra.bg' });
+    const r = classifyEducationCandidate(c);
+    expect(r.accepted).toBe(false);
+    expect(r.reason).toBe('MUNICIPALITY_PAGE');
+  });
+
+  test('every decision carries a human-readable detail', () => {
+    const accepted = classifyEducationCandidate(
+      makeCandidate({ name: 'СУ Иван Вазов', domain: 'su-ivan-vazov.bg' }),
+    );
+    const rejected = classifyEducationCandidate(
+      makeCandidate({ name: 'Община Мездра', domain: 'mezdra.bg' }),
+    );
+    expect(accepted.detail).toBeTruthy();
+    expect(rejected.detail).toBeTruthy();
   });
 
   test('accepted with educational keyword even without prefix', () => {
@@ -71,49 +135,49 @@ describe('classifyEducationCandidate — negative cases (hard rejects)', () => {
     const c = makeCandidate({ name: 'Община Мездра', domain: 'mezdra.bg' });
     const r = classifyEducationCandidate(c);
     expect(r.accepted).toBe(false);
-    expect(r.reason).toBe('municipality');
+    expect(r.reason).toBe('MUNICIPALITY_PAGE');
   });
 
   test('E — "Регистър на училищата" is rejected (registry)', () => {
     const c = makeCandidate({ name: 'Регистър на училищата', domain: 'edu.bg' });
     const r = classifyEducationCandidate(c);
     expect(r.accepted).toBe(false);
-    expect(r.reason).toBe('registry');
+    expect(r.reason).toBe('OFFICIAL_REGISTRY');
   });
 
   test('F — "Рейтинг на висшите училища" is rejected (ranking)', () => {
     const c = makeCandidate({ name: 'Рейтинг на висшите училища в България', domain: 'ranking.bg' });
     const r = classifyEducationCandidate(c);
     expect(r.accepted).toBe(false);
-    expect(r.reason).toBe('ranking');
+    expect(r.reason).toBe('DIRECTORY_OR_PORTAL');
   });
 
   test('G — "Guide Bulgaria Schools" is rejected (guide)', () => {
     const c = makeCandidate({ name: 'Guide Bulgaria Schools', domain: 'guide-bg.com' });
     const r = classifyEducationCandidate(c);
     expect(r.accepted).toBe(false);
-    expect(r.reason).toBe('guide');
+    expect(r.reason).toBe('DIRECTORY_OR_PORTAL');
   });
 
   test('rejects "Каталог на детски градини" (directory)', () => {
     const c = makeCandidate({ name: 'Каталог на детски градини' });
     const r = classifyEducationCandidate(c);
     expect(r.accepted).toBe(false);
-    expect(r.reason).toBe('directory');
+    expect(r.reason).toBe('DIRECTORY_OR_PORTAL');
   });
 
   test('rejects "Портал за образование" (portal)', () => {
     const c = makeCandidate({ name: 'Портал за образование', domain: 'edu-portal.bg' });
     const r = classifyEducationCandidate(c);
     expect(r.accepted).toBe(false);
-    expect(r.reason).toBe('portal');
+    expect(r.reason).toBe('DIRECTORY_OR_PORTAL');
   });
 
   test('rejects direct candidate with directory domain', () => {
     const c = makeCandidate({ name: 'Детска градина Слънце', domain: 'schools-catalog.bg' });
     const r = classifyEducationCandidate(c);
     expect(r.accepted).toBe(false);
-    expect(r.reason).toBe('directory_domain');
+    expect(r.reason).toBe('DIRECTORY_OR_PORTAL');
   });
 
   test('accepts extracted candidate with directory parent but own school domain', () => {
@@ -132,7 +196,7 @@ describe('classifyEducationCandidate — negative cases (hard rejects)', () => {
     const c = makeCandidate({ name: 'ООД Примерна', domain: undefined });
     const r = classifyEducationCandidate(c);
     expect(r.accepted).toBe(false);
-    expect(r.reason).toBe('insufficient_education_confidence');
+    expect(r.reason).toBe('NOT_TARGET_ORGANIZATION');
   });
 });
 
