@@ -1,3 +1,4 @@
+import { groqFastModel, maxTokensFor, reasoningParams } from '../lib/groqModels';
 import {
   emailLanguageInstruction,
   type ResolvedEmailLanguage,
@@ -62,6 +63,8 @@ export async function generatePersonalizedContent(
     return null;
   }
 
+  const model = groqFastModel();
+
   const targetContext = buildTargetContext(profile);
   if (!targetContext.trim()) {
     console.warn('[personalization] No usable profile data — skipping');
@@ -109,10 +112,11 @@ JSON:`;
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: 'llama-3.1-8b-instant',
+        model,
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.3,
-        max_tokens: 700,
+        max_tokens: maxTokensFor(model, 700),
+        ...reasoningParams(model),
       }),
     });
 

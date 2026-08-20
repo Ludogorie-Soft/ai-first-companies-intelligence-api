@@ -1,6 +1,7 @@
 import { locationSignal } from './discovery/locationMatch';
 import { signal } from './discovery/types';
 import type { DecisionSignal, ReasonCode } from './discovery/types';
+import { groqHeavyModel, reasoningParams } from '../lib/groqModels';
 
 export interface DiscoveryParams {
   persona: string;
@@ -440,22 +441,14 @@ const LLM_REASON_CODES: ReasonCode[] = [
   'OFFICIAL_REGISTRY', 'LOCATION_CONFLICT', 'NOT_TARGET_ORGANIZATION',
 ];
 
-// Verified against this account's GET /openai/v1/models on 2026-08-17. The Llama
-// models this code used to default to (`llama-3.1-8b-instant`, and later
-// `llama-3.3-70b-versatile`) both return HTTP 404 "model does not exist or you do
-// not have access to it" — which is why the filter had been failing on every call.
-// Of the chat models still available, only gpt-oss-120b reliably honours
-// `response_format: json_object` for this prompt; gpt-oss-20b and qwen3.6-27b
-// both answer 400 "Failed to validate JSON".
-const DEFAULT_GROQ_MODEL = 'openai/gpt-oss-120b';
-
+// Model names and the reasoning-effort guard now live in ../lib/groqModels — see
+// there for why these names and what a Groq deprecation breaks. This filter needs
+// the heavy tier specifically: it sends `response_format: json_object`, which only
+// gpt-oss-120b honours for this prompt. `GROQ_FILTER_MODEL` still wins so an
+// existing deployment that already sets it keeps its model.
 /** Exported so the worker can name the live model in its startup banner. */
 export function groqModel(): string {
-  return process.env.GROQ_FILTER_MODEL || DEFAULT_GROQ_MODEL;
-}
-
-function supportsReasoningEffort(): boolean {
-  return /gpt-oss|qwen3|deepseek-r1/i.test(groqModel());
+  return process.env.GROQ_FILTER_MODEL || groqHeavyModel();
 }
 
 /**
@@ -562,10 +555,9 @@ async function callGroq(apiKey: string, prompt: string, attempt = 0): Promise<st
       temperature: 0,
       max_tokens: GROQ_MAX_TOKENS,
       response_format: { type: 'json_object' },
-      // Only reasoning models accept this, and it roughly quarters the thinking
-      // tokens (130 → 30 on a 15-item chunk) with no loss on a task this
-      // mechanical. Sending it to a non-reasoning model is a 400, hence the guard.
-      ...(supportsReasoningEffort() ? { reasoning_effort: 'low' } : {}),
+      // Roughly quarters the thinking tokens (130 → 30 on a 15-item chunk) with no
+      // loss on a task this mechanical; expands to nothing on a non-reasoning model.
+      ...reasoningParams(groqModel()),
     }),
     signal: AbortSignal.timeout(GROQ_TIMEOUT_MS),
   });
