@@ -1,3 +1,4 @@
+import { groqHeavyModel, maxTokensFor, reasoningParams } from '../lib/groqModels';
 import {
   emailLanguageInstruction,
   type ResolvedEmailLanguage,
@@ -94,6 +95,8 @@ async function callGroqApi(systemPrompt: string, userContent: string): Promise<s
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) throw new Error('GROQ_API_KEY not set');
 
+  const model = groqHeavyModel();
+
   const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -101,8 +104,9 @@ async function callGroqApi(systemPrompt: string, userContent: string): Promise<s
       'authorization': `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      model: 'llama-3.3-70b-versatile',
-      max_tokens: 1024,
+      model,
+      max_tokens: maxTokensFor(model, 1024),
+      ...reasoningParams(model),
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userContent },

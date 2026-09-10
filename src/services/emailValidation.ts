@@ -1,3 +1,4 @@
+import { groqFastModel, maxTokensFor, reasoningParams } from '../lib/groqModels';
 import type { CrawledPage } from '../worker/crawl';
 
 export interface ValidatedEmail {
@@ -43,9 +44,11 @@ async function callGroqApi(systemPrompt: string, userContent: string): Promise<s
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) throw new Error('GROQ_API_KEY not set');
 
+  const model = groqFastModel();
   const body = JSON.stringify({
-    model: 'llama-3.1-8b-instant',
-    max_tokens: 256,
+    model,
+    max_tokens: maxTokensFor(model, 256),
+    ...reasoningParams(model),
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userContent },
