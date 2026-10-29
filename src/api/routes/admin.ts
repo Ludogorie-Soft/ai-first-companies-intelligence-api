@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
 import { requireAuth, requireAdmin } from '../../middleware/auth';
 import { createAuditLog } from '../../services/auditLog';
+import { getQueue, QUEUES } from '../../lib/queue';
 
 const router = Router();
 
@@ -194,6 +195,27 @@ router.get('/audit-log', requireAuth, requireAdmin, async (req: Request, res: Re
     });
   } catch (err) {
     console.error('[admin/audit-log]', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /api/admin/queues — pending job counts per pg-boss queue (moved off /health so
+// uptime checks don't wake the database)
+router.get('/queues', requireAuth, requireAdmin, async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const queue = await getQueue();
+    const [crawl, discover, personalize] = await Promise.all([
+      queue.getQueueSize(QUEUES.CRAWL_COMPANY),
+      queue.getQueueSize(QUEUES.DISCOVER_PERSONA),
+      queue.getQueueSize(QUEUES.PERSONALIZE_COMPANY),
+    ]);
+    res.json({
+      [QUEUES.CRAWL_COMPANY]: crawl,
+      [QUEUES.DISCOVER_PERSONA]: discover,
+      [QUEUES.PERSONALIZE_COMPANY]: personalize,
+    });
+  } catch (err) {
+    console.error('[admin/queues]', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

@@ -25,28 +25,23 @@ import { generateCampaignEmail } from '../services/campaignEmailGeneration';
 import { parseEmailLanguage, resolveEmailLanguage } from '../lib/emailLanguage';
 import type { EmailLanguagePreference } from '../lib/emailLanguage';
 import PgBoss from 'pg-boss';
+import { QueuePoller, PollerTimings } from './queuePoller';
 
 const CONCURRENCY = parseInt(process.env.WORKER_CONCURRENCY || '5', 10);
 
-async function processJob(jobs: PgBoss.JobWithMetadata<CrawlCompanyPayload>[]): Promise<void> {
-  for (const job of jobs) {
-    try {
-      await processSingleJob(job);
-    } catch (err) {
-      // Fail only this job. Letting the error escape the handler makes pg-boss fail the
-      // ENTIRE batch of `batchSize` jobs, forcing siblings that already crawled
-      // successfully through a full re-crawl (Playwright + validation + LLM) on retry.
-      try {
-        const boss = await getQueue();
-        await boss.fail(QUEUES.CRAWL_COMPANY, job.id, {
-          message: err instanceof Error ? err.message : String(err),
-        });
-      } catch (failErr) {
-        console.error(`[worker] could not mark job ${job.id} failed:`, failErr);
-      }
-    }
-  }
+function envSeconds(name: string, fallback: number): number {
+  const value = parseInt(process.env[name] || '', 10);
+  return (Number.isFinite(value) && value > 0 ? value : fallback) * 1000;
 }
+
+// Polling cadence — see QueuePoller. The idle interval must stay above Neon's 5-minute
+// suspend timeout, otherwise the database never scales to zero.
+const POLLER_TIMINGS: PollerTimings = {
+  activeIntervalMs:      envSeconds('QUEUE_ACTIVE_POLL_SECONDS', 5),
+  idleIntervalMs:        envSeconds('QUEUE_IDLE_POLL_SECONDS', 15 * 60),
+  idleAfterMs:           envSeconds('QUEUE_IDLE_AFTER_SECONDS', 2 * 60),
+  maintenanceIntervalMs: envSeconds('QUEUE_MAINTENANCE_INTERVAL_SECONDS', 15 * 60),
+};
 
 async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>): Promise<void> {
   const { companyId, domain, baseUrl, batchId, tenantId, templateId, emailLanguage: rawEmailLanguage } = job.data;
@@ -898,27 +893,24 @@ export async function startWorker(): Promise<void> {
   await reportChromiumAvailability();
   const queue = await getQueue();
 
-  queue.work<CrawlCompanyPayload>(
-    QUEUES.CRAWL_COMPANY,
-    { batchSize: CONCURRENCY, includeMetadata: true },
-    processJob
+  // Replaces boss.work(): polls fast while there is work and backs off when idle so
+  // Neon can scale to zero. Each job is completed / failed individually — a failure
+  // never fails siblings fetched in the same batch.
+  const poller = new QueuePoller(
+    queue,
+    [
+      { name: QUEUES.CRAWL_COMPANY,       batchSize: CONCURRENCY, handler: processSingleJob },
+      { name: QUEUES.DISCOVER_PERSONA,    batchSize: 1,           handler: processDiscoverJob },
+      { name: QUEUES.PERSONALIZE_COMPANY, batchSize: 2,           handler: processPersonalizeJob },
+    ],
+    POLLER_TIMINGS,
+    {
+      // Drop idle Prisma connections so they can't keep the Neon compute awake;
+      // Prisma reconnects lazily on the next query.
+      onIdle: () => prisma.$disconnect(),
+    },
   );
-
-  queue.work<DiscoverPersonaPayload>(
-    QUEUES.DISCOVER_PERSONA,
-    { batchSize: 1, includeMetadata: true },
-    async (jobs) => {
-      for (const job of jobs) await processDiscoverJob(job);
-    }
-  );
-
-  queue.work<PersonalizeCompanyPayload>(
-    QUEUES.PERSONALIZE_COMPANY,
-    { batchSize: 2, includeMetadata: true },
-    async (jobs) => {
-      for (const job of jobs) await processPersonalizeJob(job);
-    }
-  );
+  await poller.start();
 
   // Identity banner. pg-boss hands each job to whichever consumer polls first, so a
   // forgotten worker from an older build will happily process jobs alongside this
@@ -929,11 +921,16 @@ export async function startWorker(): Promise<void> {
     `[worker] pid=${process.pid} filter=${FILTER_VERSION} model=${groqModel()} ` +
     `concurrency=${CONCURRENCY} node=${process.version}`,
   );
-  console.log(`[worker] listening on queues "${QUEUES.CRAWL_COMPANY}", "${QUEUES.DISCOVER_PERSONA}", "${QUEUES.PERSONALIZE_COMPANY}" (concurrency: ${CONCURRENCY})`);
+  console.log(
+    `[worker] polling queues "${QUEUES.CRAWL_COMPANY}", "${QUEUES.DISCOVER_PERSONA}", "${QUEUES.PERSONALIZE_COMPANY}" ` +
+    `(concurrency: ${CONCURRENCY}, active: ${POLLER_TIMINGS.activeIntervalMs / 1000}s, ` +
+    `idle: ${POLLER_TIMINGS.idleIntervalMs / 1000}s after ${POLLER_TIMINGS.idleAfterMs / 1000}s without jobs)`,
+  );
 
   // Graceful shutdown — handles both standalone and embedded modes
   const shutdown = async (signal: string) => {
     console.log(`[worker] received ${signal}, shutting down...`);
+    await poller.stop();
     await stopQueue();
     await prisma.$disconnect();
     process.exit(0);

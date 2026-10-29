@@ -4,7 +4,6 @@ import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import { swaggerSpec } from '../lib/swagger';
-import { getQueue, QUEUES } from '../lib/queue';
 
 import authRouter from './routes/auth';
 import adminRouter from './routes/admin';
@@ -67,34 +66,10 @@ app.use(cors({ origin: allowedOrigin }));
 app.use(morgan('dev'));
 app.use(express.json());
 
-app.get('/health', async (_req, res) => {
-  const body: {
-    status: string;
-    timestamp: string;
-    queues?: Record<string, number>;
-    queueError?: string;
-  } = {
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-  };
-
-  try {
-    const queue = await getQueue();
-    const [crawl, discover, personalize] = await Promise.all([
-      queue.getQueueSize(QUEUES.CRAWL_COMPANY),
-      queue.getQueueSize(QUEUES.DISCOVER_PERSONA),
-      queue.getQueueSize(QUEUES.PERSONALIZE_COMPANY),
-    ]);
-    body.queues = {
-      [QUEUES.CRAWL_COMPANY]: crawl,
-      [QUEUES.DISCOVER_PERSONA]: discover,
-      [QUEUES.PERSONALIZE_COMPANY]: personalize,
-    };
-  } catch (err) {
-    body.queueError = err instanceof Error ? err.message : String(err);
-  }
-
-  res.json(body);
+// Deliberately DB-free: uptime monitors hitting /health must not wake Neon.
+// Queue sizes live at GET /api/admin/queues.
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
 // CDN-backed Swagger UI (works on Vercel; local swagger-ui-dist assets are not bundled).

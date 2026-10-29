@@ -179,7 +179,7 @@ Browser / Frontend  →  Vercel (Express)  →  Neon (Prisma + pg-boss jobs)
 
 `vercel.json` already skips Playwright browser download and builds with Prisma + Swagger + `tsc`. The entry is `api/index.ts`, which exports Express without importing the worker.
 
-3. After deploy, check `GET /health` (includes pending queue sizes) and `/docs`.
+3. After deploy, check `GET /health` and `/docs`. `/health` never touches the database (so uptime monitors don't wake Neon); pending queue sizes are at `GET /api/admin/queues` (admin only).
 
 ## Mac (worker)
 
@@ -208,6 +208,17 @@ Worker `.env` essentials:
 | `ENABLE_EMBEDDED_WORKER` | **Do not set** |
 
 No inbound ports or public URL are required. The worker polls Neon for pg-boss jobs enqueued by the Vercel API.
+
+### Polling and Neon scale-to-zero
+
+Neon suspends the compute after ~5 minutes without queries, and every query wakes it. The worker therefore polls adaptively (`src/worker/queuePoller.ts`) instead of pg-boss' fixed 2-second loop:
+
+- while jobs are running it polls every `QUEUE_ACTIVE_POLL_SECONDS` (default 5) and drains queues back-to-back;
+- after `QUEUE_IDLE_AFTER_SECONDS` (default 120) with no jobs it runs pg-boss maintenance once, closes its Prisma connections and polls only every `QUEUE_IDLE_POLL_SECONDS` (default 900 = 15 min).
+
+**Trade-off:** when the worker is idle, a new batch can wait up to `QUEUE_IDLE_POLL_SECONDS` before it starts. Lower it for faster pickup, but keep it above 300 (Neon's suspend timeout) or the database never sleeps.
+
+pg-boss' own `supervise` / `schedule` loops are off; the worker runs maintenance itself (startup, every `QUEUE_MAINTENANCE_INTERVAL_SECONDS` while busy, and on going idle). Set `QUEUE_SUPERVISE=true` to restore the built-in loop on a database where idle cost doesn't matter.
 
 ### Keep the worker running
 

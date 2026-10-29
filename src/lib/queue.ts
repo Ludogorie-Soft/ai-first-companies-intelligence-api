@@ -65,12 +65,17 @@ export async function getQueue(): Promise<PgBoss> {
 
   globalForBoss.__pgBossPromise = (async () => {
     const vercel = isVercelRuntime();
+    // pg-boss' built-in supervise/schedule loops query the DB every few seconds
+    // forever, which keeps Neon from scaling to zero. Maintenance is run instead by
+    // the worker's QueuePoller (on startup, while busy, and when going idle).
+    // No cron schedules are used. QUEUE_SUPERVISE=true restores the built-in loop
+    // (e.g. for a local Postgres where idle cost doesn't matter).
+    const supervise = !vercel && process.env.QUEUE_SUPERVISE === 'true';
     const boss = new PgBoss({
       connectionString,
       retentionDays: 7,
-      // On Vercel the API only enqueues; the Mac worker runs supervise/schedule.
-      supervise: !vercel,
-      schedule: !vercel,
+      supervise,
+      schedule: false,
       // Avoid opening a large pool per serverless isolate.
       max: vercel ? 2 : undefined,
     });
@@ -86,7 +91,7 @@ export async function getQueue(): Promise<PgBoss> {
     await boss.createQueue(QUEUES.DISCOVER_PERSONA);
     await boss.createQueue(QUEUES.PERSONALIZE_COMPANY);
 
-    console.log(`[pg-boss] started (vercel=${vercel}, supervise=${!vercel})`);
+    console.log(`[pg-boss] started (vercel=${vercel}, supervise=${supervise})`);
     globalForBoss.__pgBoss = boss;
     return boss;
   })();
